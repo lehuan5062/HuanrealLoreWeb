@@ -34,16 +34,17 @@ folder was deleted. lore-web fixes these by owning the refresh path: see
 ### Any platform (terminal)
 
 ```sh
-cd lore-web
+git clone <this-repo-url>
+cd HUANREAL-Lore-Web
 npm install       # pulls @lore-vcs/sdk (and its native lorelib) from npm
 npm start         # launch the server and open http://127.0.0.1:7420
 ```
 
 Then click **Add**, paste the path to a Lore working copy, and you're in.
 
-> **Sharing with a collaborator:** the `lore-web` folder is self-contained — send
-> only that folder (no need to clone this repository). They run `setup.bat` (or
-> `npm install`) once, then `lore login lore://<your-host>:41337`. See the
+> **Sharing with a collaborator:** this entire repository is self-contained. They
+> can clone it, then run `setup.bat` (or `npm install`) once, followed by
+> `lore login lore://<your-host>:41337`. See the
 > [how-to guide](docs/how-to/run-lore-web.md).
 
 - Run headless (no browser auto-open): `npm run serve`

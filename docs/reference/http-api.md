@@ -1,8 +1,16 @@
 # lore-web HTTP API
 
 The lore-web server exposes a small JSON + streaming API on `127.0.0.1:7420`
-(configurable). The browser SPA is its only intended client. All repository data
-is read live from the Lore SDK on each request; nothing is cached server-side.
+(configurable). The browser SPA is its only intended client. Repository reads
+(`/api/repos`, `/api/status`, `/api/history`, `/api/branches`, `/api/org`) are
+cached per repository with stale-while-revalidate: a filesystem watch and every
+mutating request invalidate the affected entries, so a warm cache serves
+instantly while still reflecting recent changes within moments. A time-to-live
+bounds staleness for changes the watch cannot see. The cache persists to
+`~/.lore-web/cache.json` and rehydrates on startup, so a restart serves
+last-known data immediately instead of waiting on native reads; a background
+revalidate corrects it, pushing an `/events` refresh if anything changed while
+the server was down.
 
 ## Conventions
 
@@ -18,7 +26,7 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 
 | Method | Path | Body / query | Description |
 | --- | --- | --- | --- |
-| GET | `/api/repos` | — | List tracked repos, each enriched with live `branch`, `exists`, and `organization`. |
+| GET | `/api/repos` | — | List tracked repos, each enriched with live `branch`, `exists`, and `organization`. On a cold cache, returns immediately with `enriching: true` and unenriched entries (`branch`/`organization` absent), then finishes enrichment in the background and emits an `/events` refresh when it completes. |
 | POST | `/api/repos` | `{ path, label }` | Start tracking a working copy. Rejects non-repos. |
 | DELETE | `/api/repos` | `{ path }` | Stop tracking. Always succeeds, even if the folder is gone. |
 
@@ -34,7 +42,7 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 
 | Method | Path | Query | Description |
 | --- | --- | --- | --- |
-| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `hasLoreignore`, `hasGitignore`, and `hasP4ignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. |
+| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `hasLoreignore`, `hasGitignore`, and `hasP4ignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. The full working-tree scan (which discovers untracked files, and can take seconds on a large working copy) does not block the response: the first read after a repo switch returns with `scanning: true` and only staged/tracked changes, then the scan completes in the background and an `/events` refresh tells the SPA to refetch the complete list. |
 | GET | `/api/history` | `path`, `length` | Revision history (default 50), with message and timestamp. |
 | GET | `/api/branches` | `path` | Branch list. |
 | GET | `/api/diff` | `path`, `file` | Unified diff for one file. |

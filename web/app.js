@@ -1,7 +1,8 @@
-// lore-web single-page UI. Vanilla ES modules, no build step. The guiding rule:
-// never trust a cached snapshot — every view refetches live (on select, on a
-// file-watch "refresh" push, on window focus, and on a slow history poll), which
-// is what keeps lists fresh where the desktop app went stale.
+// lore-web single-page UI. Vanilla ES modules, no build step. Data is cached on
+// the server (per-repo status/history/branches) and invalidated automatically
+// (filesystem watch + every mutating verb). Stale-while-revalidate keeps reads
+// instant, and TTL bounds staleness for changes the watcher cannot see. A brief
+// stale view is acceptable; the SSE refresh corrects it moments later.
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -66,12 +67,27 @@ function toast(msg, isErr) {
 
 async function loadRepos() {
   try {
-    const { repos } = await apiGet("/api/repos");
+    if (state.repos.length === 0) {
+      const ul = $("#repo-list");
+      ul.innerHTML = '<li class="skeleton"></li><li class="skeleton"></li><li class="skeleton"></li>';
+    }
+    const { repos, enriching } = await apiGet("/api/repos");
     state.repos = repos;
+    // On a cold server cache, the list arrives instantly but without live
+    // branch/organization data; the server enriches it in the background and
+    // pushes an "enriched" SSE refresh when done, which re-triggers loadRepos.
+    state.reposEnriching = !!enriching;
     renderRepos();
   } catch (err) {
     toast(err.message, true);
   }
+}
+
+/** The repo row's branch slot: a shimmering placeholder while the server is still enriching, else the live branch or a "missing" flag. */
+function repoBranchSlot(r) {
+  if (!r.exists) return `<span class="r-missing">missing</span>`;
+  if (state.reposEnriching && !r.branch) return `<span class="skeleton r-branch-skel"></span>`;
+  return `<span class="r-branch">${r.branch || ""}</span>`;
 }
 
 function renderRepos() {
@@ -83,10 +99,13 @@ function renderRepos() {
     li.innerHTML = `
       <span class="r-name" title="${r.path}">${r.label}</span>
       ${r.organization ? `<span class="r-org">${r.organization}</span>` : ""}
-      ${r.exists ? `<span class="r-branch">${r.branch || ""}</span>` : `<span class="r-missing">missing</span>`}
+      ${repoBranchSlot(r)}
       <button class="r-remove" title="Remove">✕</button>`;
     // Select on a click anywhere in the row, not only the label, so the whole
-    // row is one big hit target. The remove button stops propagation below.
+    // row is one big hit target — even while enrichment is still in flight,
+    // since the repo view's own data (status/history/branches) is fetched
+    // independently of this sidebar summary. The remove button stops
+    // propagation below.
     li.onclick = () => selectRepo(r.path);
     li.querySelector(".r-remove").onclick = (e) => {
       e.stopPropagation();
@@ -174,6 +193,19 @@ function showEmpty() {
   $("#repo-view").hidden = true;
 }
 
+/** Clear the active repo view and show a loading skeleton to prevent stale content flash on repo switch. */
+function clearRepoView() {
+  $("#staged-files").innerHTML = '<li class="skeleton"></li><li class="skeleton"></li><li class="skeleton"></li>';
+  $("#unstaged-files").innerHTML = '<li class="skeleton"></li><li class="skeleton"></li><li class="skeleton"></li>';
+  $("#history-list").innerHTML = '<li class="skeleton"></li><li class="skeleton"></li><li class="skeleton"></li>';
+  $("#branch-list").innerHTML = '<li class="skeleton"></li><li class="skeleton"></li><li class="skeleton"></li>';
+  $("#repo-branch").textContent = "";
+  $("#diff-view").classList.remove("show");
+  state.historySig = null;
+  state.openRevision = null;
+  $("#repo-view").classList.add("loading");
+}
+
 async function selectRepo(path) {
   state.active = path;
   state.selectedFile = null;
@@ -184,7 +216,12 @@ async function selectRepo(path) {
   $("#repo-path").textContent = path;
   renderRepos();
   loadOrg(path);
-  await refreshActive();
+  clearRepoView();
+  try {
+    await refreshActive();
+  } finally {
+    $("#repo-view").classList.remove("loading");
+  }
 }
 
 /**
@@ -229,10 +266,12 @@ function fileBadge(f) {
   return ["M", "badge-M"];
 }
 
-/** Fetches repository status and renders the staged/unstaged file lists. */
+/** Fetches repository status and renders the staged/unstaged file lists. Ignores stale responses when the active repo has changed. */
 async function loadStatus(pathEnc) {
+  const forPath = state.active;
   try {
     const data = await apiGet(`/api/status?path=${pathEnc}`);
+    if (state.active !== forPath) return;
     $("#repo-branch").textContent = data.branch || "";
     const staged = data.files.filter((f) => f.flagStaged);
     const unstaged = data.files.filter((f) => !f.flagStaged);
@@ -380,6 +419,12 @@ function updateChangesBar(data) {
   const nested = files.filter((f) => f.nested);
   const stale = files.filter((f) => f.type === 0 && f.action === 2 && !f.nested);
 
+  if (data.scanning) {
+    const note = document.createElement("span");
+    note.className = "bar-note";
+    note.textContent = "Scanning for new files…";
+    bar.appendChild(note);
+  }
   if (data.hasLoreignore === false) {
     bar.appendChild(barButton("Initialize .loreignore", initLoreignore));
   } else if (data.hasGitignore || data.hasP4ignore) {
@@ -477,8 +522,10 @@ async function commit() {
 }
 
 async function loadHistory(pathEnc) {
+  const forPath = state.active;
   try {
     const { revisions } = await apiGet(`/api/history?path=${pathEnc}&length=50`);
+    if (state.active !== forPath) return;
     state.revisions = revisions;
     // Skip the rebuild when nothing changed, so a background refresh (poll, focus,
     // file-watch) does not collapse a revision the user has expanded.
@@ -565,8 +612,10 @@ async function showRevisionFileDiff(r, parent, file, detail) {
 }
 
 async function loadBranches(pathEnc) {
+  const forPath = state.active;
   try {
     const { branches } = await apiGet(`/api/branches?path=${pathEnc}`);
+    if (state.active !== forPath) return;
     const ul = $("#branch-list");
     ul.innerHTML = "";
     const seen = new Set();
@@ -671,6 +720,40 @@ async function runOp(title, path, payload) {
   await refreshActive();
 }
 
+/** Scheduler that coalesces overlapping refresh requests (focus, SSE, poll) into a single debounced update. */
+let refreshPending = null;
+let refreshWantRepos = false;
+let refreshWantActive = false;
+let refreshInflight = false;
+
+/**
+ * Request a refresh with coalescing — multiple calls within 150ms are batched
+ * into one. Prevents refresh storms from focus + SSE + poll stacking up.
+ * @param {{ repos?: boolean, active?: boolean }} what to refresh
+ */
+function scheduleRefresh({ repos = false, active = false } = {}) {
+  refreshWantRepos = refreshWantRepos || repos;
+  refreshWantActive = refreshWantActive || active;
+  if (refreshPending) return;
+  refreshPending = setTimeout(() => {
+    refreshPending = null;
+    const wantRepos = refreshWantRepos;
+    const wantActive = refreshWantActive;
+    refreshWantRepos = false;
+    refreshWantActive = false;
+    (async () => {
+      if (refreshInflight) return;
+      refreshInflight = true;
+      try {
+        if (wantRepos) await loadRepos();
+        if (wantActive && state.active && !refreshInflight) await refreshActive();
+      } finally {
+        refreshInflight = false;
+      }
+    })();
+  }, 150);
+}
+
 function connectSSE() {
   const es = new EventSource("/events");
   es.onopen = () => $("#conn").classList.add("live");
@@ -683,9 +766,9 @@ function connectSSE() {
       return;
     }
     if (msg.type === "refresh") {
-      if (msg.repo === "*") loadRepos();
-      else if (msg.repo === state.active) refreshActive();
-      else loadRepos(); // a non-active repo changed; keep the sidebar fresh
+      if (msg.repo === "*") scheduleRefresh({ repos: true });
+      else if (msg.repo === state.active) scheduleRefresh({ repos: true, active: true });
+      else scheduleRefresh({ repos: true });
     }
   };
 }
@@ -984,13 +1067,17 @@ function wire() {
     };
   });
 
-  // Freshness: refetch when the window regains focus.
+  // Freshness: refetch when the window regains focus (coalesced).
   window.addEventListener("focus", () => {
-    loadRepos();
-    refreshActive();
+    if (document.hidden) return;
+    scheduleRefresh({ repos: true, active: true });
   });
-  // Slow poll catches revisions pushed by the other machine (no local fs event).
-  setInterval(() => state.active && loadHistory(encodeURIComponent(state.active)), 10000);
+  // Slow poll catches revisions pushed by the remote (no local fs event).
+  setInterval(() => {
+    if (state.active && !document.hidden) {
+      scheduleRefresh({ active: true });
+    }
+  }, 10000);
 }
 
 wire();

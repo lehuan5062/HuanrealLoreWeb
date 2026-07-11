@@ -2,6 +2,12 @@
 // This is the everyday entry point (`npm start` / start.bat); use `npm run serve`
 // to run headless without opening a browser.
 
+// Koffi runs native SDK calls on the libuv threadpool, whose default of 4
+// workers throttles multi-repo enrichment on startup. libuv sizes the pool
+// lazily on its first use, so this must be set before index.mjs (which loads
+// the SDK) is imported below.
+if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = "16";
+
 import { spawn } from "node:child_process";
 import { connect } from "node:net";
 

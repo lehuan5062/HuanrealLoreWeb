@@ -19,6 +19,7 @@ import { watchRepo, unwatchRepo } from "./watcher.mjs";
 import { isLoggedIn, runCli } from "./cli.mjs";
 import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore, hasP4ignore } from "./loreignore.mjs";
 import { discoverServers } from "./discovery.mjs";
+import * as cache from "./cache.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(HERE, "..", "web");
@@ -97,6 +98,32 @@ function toUnixPath(p) {
   return p.replace(/\\/g, "/");
 }
 
+/**
+ * Invalidate cached data for a repository and notify all clients to refetch.
+ * Invalidation happens before broadcast so SSE-triggered refetches hit fresh
+ * data. Call this whenever a repository changes (filesystem watch, mutating verb).
+ * @param {string} repoPath repository path, or "*" to invalidate all repos
+ * @param {string} reason description of the change, for logging
+ */
+function notifyChanged(repoPath, reason) {
+  if (repoPath === "*") {
+    cache.invalidateAll();
+  } else {
+    cache.invalidateRepo(repoPath);
+  }
+  broadcastRefresh(repoPath, reason);
+}
+
+// A persisted cache entry is served stale-but-instant on the first read after
+// restart, then revalidated in the background (see cache.mjs). When that
+// revalidate changes the value, broadcast (not invalidate — the cache already
+// holds the fresh value) so clients refetch and pick it up.
+cache.onUpdate((key) => {
+  if (key === "repos") return broadcastRefresh("*", "revalidated");
+  const repoPath = key.split(" ")[0];
+  broadcastRefresh(repoPath, "revalidated");
+});
+
 function sendJson(res, status, body) {
   const text = JSON.stringify(body);
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -155,43 +182,81 @@ async function serveStatic(req, res, pathname) {
   }
 }
 
-/** GET /api/repos — tracked repos, each enriched with live branch/exists. */
+/**
+ * Enrich one tracked repo entry with its live branch/status and organization,
+ * each fetched via a separate native store read. The two reads run in
+ * parallel, and each degrades independently on failure (a broken metadata
+ * read must not blank out a working status, or vice versa).
+ * @param {import("./store.mjs").RepoEntry} r a tracked repo entry
+ * @returns {Promise<object>} the entry merged with `exists`, `organization`, and status fields
+ */
+async function enrichRepo(r) {
+  const exists = isRepo(r.path);
+  if (!exists) return { ...r, exists, organization: "" };
+
+  const [info, organization] = await Promise.all([
+    collect("repositoryStatus", { repositoryPath: r.path }, { staged: false })
+      .then((events) => xform.repoSummary(events))
+      .catch((err) => {
+        log.debug("repo enrich failed", { path: r.path, message: err instanceof Error ? err.message : String(err) });
+        return {};
+      }),
+    readOrg(r.path)
+      .then((org) => org.organization)
+      .catch((err) => {
+        log.debug("repo org read failed", { path: r.path, message: err instanceof Error ? err.message : String(err) });
+        return "";
+      }),
+  ]);
+  return { ...r, exists, organization, ...info };
+}
+
+/**
+ * Enrich every tracked repo in parallel and cache the result under `"repos"`.
+ * Callers on a cold cache should prefer `listRepos`, which serves an
+ * unenriched list immediately instead of waiting on this.
+ * @returns {Promise<object[]>} enriched repo entries
+ */
+async function enrichRepos() {
+  return cache.cached("repos", cache.TTL.list, () => Promise.all(store.listRepos().map(enrichRepo)));
+}
+
+/**
+ * GET /api/repos — tracked repos, enriched with live branch/organization.
+ * On a warm cache this returns instantly. On a cold cache (fresh server
+ * start, or after invalidation) the native store reads that back branch and
+ * organization data can take seconds across many repos; rather than block
+ * the response on them, an unenriched list (name, path, `exists`) is returned
+ * immediately and the enrichment runs in the background — when it completes,
+ * `notifyChanged("*", "enriched")` tells clients to refetch the full list.
+ */
 async function listRepos(res) {
-  const repos = store.listRepos();
-  const enriched = await Promise.all(
-    repos.map(async (r) => {
-      const exists = isRepo(r.path);
-      let info = {};
-      let organization = "";
-      if (exists) {
-        try {
-          info = xform.repoSummary(await collect("repositoryStatus", { repositoryPath: r.path }, { staged: false }));
-        } catch (err) {
-          log.debug("repo enrich failed", { path: r.path, message: err instanceof Error ? err.message : String(err) });
-        }
-        try {
-          organization = (await readOrg(r.path)).organization;
-        } catch (err) {
-          log.debug("repo org read failed", { path: r.path, message: err instanceof Error ? err.message : String(err) });
-        }
-      }
-      return { ...r, exists, organization, ...info };
-    }),
-  );
-  sendJson(res, 200, { repos: enriched });
+  if (cache.has("repos")) {
+    return sendJson(res, 200, { repos: await enrichRepos() });
+  }
+  const repos = store.listRepos().map((r) => ({ ...r, exists: isRepo(r.path), organization: "" }));
+  sendJson(res, 200, { repos, enriching: true });
+  // The cache is now populated by enrichRepos(), so broadcast directly rather
+  // than notifyChanged (which would invalidate what was just cached).
+  enrichRepos()
+    .then(() => broadcastRefresh("*", "enriched"))
+    .catch((err) => log.debug("repo list enrichment failed", { message: err instanceof Error ? err.message : String(err) }));
 }
 
 /**
  * Read a repository's organization, parsed from its `name` metadata. Lore stores
  * the name as an `org/repo` value; the prefix before the first slash is the
  * organization. Reads local metadata only (the working copy), matching what the
- * desktop client surfaces.
+ * desktop client surfaces. Results are cached and invalidated on repo changes.
  * @param {string} repoPath path to a Lore working copy
  * @returns {Promise<{ organization: string, repoName: string, name: string }>}
  */
 async function readOrg(repoPath) {
-  const events = await collect("repositoryMetadataGet", { repositoryPath: repoPath, local: true }, { key: "name" });
-  return xform.splitOrg(xform.metadata(events).name);
+  const key = cache.repoKey(repoPath, "org");
+  return cache.cached(key, cache.TTL.repo, async () => {
+    const events = await collect("repositoryMetadataGet", { repositoryPath: repoPath, local: true }, { key: "name" });
+    return xform.splitOrg(xform.metadata(events).name);
+  });
 }
 
 /**
@@ -234,7 +299,7 @@ async function setOrg(req, res) {
   const repositoryUrl = `${base}/${organization}/${repoName}`;
   log.info("changing organization", { path, from: current.organization, to: organization });
   const id = await recreateLore(path, repositoryUrl);
-  broadcastRefresh("*", "repos");
+  notifyChanged("*", "setOrg");
   return sendJson(res, 200, { ...xform.splitOrg(`${organization}/${repoName}`), id });
 }
 
@@ -265,8 +330,8 @@ async function addRepo(req, res) {
     initialized = true;
   }
   const entry = store.addRepo(path, label);
-  watchRepo(path, () => broadcastRefresh(path, "fs"));
-  broadcastRefresh("*", "repos");
+  watchRepo(path, () => notifyChanged(path, "fs"));
+  notifyChanged("*", "addRepo");
   sendJson(res, 200, { repo: entry, initialized });
 }
 
@@ -292,7 +357,7 @@ async function repairRepo(path, res) {
   const label = path.split(/[\\/]/).filter(Boolean).pop() || path;
   const repositoryUrl = `${remote ? remoteBase(remote) : defaultRemoteBase().replace(/\/+$/, "")}/${label}`;
   const id = await recreateLore(path, repositoryUrl);
-  broadcastRefresh(path, "repair");
+  notifyChanged(path, "repair");
   sendJson(res, 200, { ok: true, id });
 }
 
@@ -505,6 +570,61 @@ async function browse(res, rawPath) {
 }
 
 /**
+ * Read a repository's status, optionally including the full working-tree
+ * scan. `scan: false` skips discovering untracked files and is fast even on
+ * large working copies; `scan: true` is the complete picture but can take
+ * seconds on a repo with many files.
+ * @param {string} repoPath repository path
+ * @param {Record<string, unknown>} globalArgs SDK global args (repositoryPath)
+ * @param {boolean} scan whether to run the full working-tree scan
+ * @returns {Promise<object>} status data with hasLoreignore/hasGitignore/hasP4ignore and nested flags applied
+ */
+async function fetchStatus(repoPath, globalArgs, scan) {
+  const events = await collect("repositoryStatus", globalArgs, { staged: true, scan });
+  const data = xform.status(events);
+  // The UI offers an "Initialize .loreignore" action when one is absent.
+  data.hasLoreignore = hasLoreignore(repoPath);
+  data.hasGitignore = hasGitignore(repoPath);
+  data.hasP4ignore = hasP4ignore(repoPath);
+  // Flag entries that are themselves Lore working copies (a directory holding
+  // its own .lore). The UI prompts to ignore these *while they still exist* —
+  // the only way to avoid the unremovable "zombie" entry Lore leaves behind if
+  // an indexed nested repo is later deleted.
+  for (const f of data.files) {
+    if (f.type === 0 && isRepo(join(repoPath, f.path))) f.nested = true;
+  }
+  return data;
+}
+
+/** Repo paths with a background full status scan currently in flight, to avoid starting duplicates. */
+const scanningRepos = new Set();
+
+/**
+ * Kick off the full working-tree scan in the background after a fast
+ * (`scan: false`) status response has already gone out, so a repo switch is
+ * never blocked on scanning a large working copy. On completion, the cached
+ * status entry is replaced with the complete result and clients are told to
+ * refetch; deduped per repo so overlapping requests do not start redundant
+ * scans.
+ * @param {string} repoPath repository path
+ * @param {Record<string, unknown>} globalArgs SDK global args (repositoryPath)
+ * @param {string} key the cache key the fast result was stored under
+ */
+function startBackgroundScan(repoPath, globalArgs, key) {
+  if (scanningRepos.has(repoPath)) return;
+  scanningRepos.add(repoPath);
+  fetchStatus(repoPath, globalArgs, true)
+    .then((data) => {
+      cache.put(key, data);
+      broadcastRefresh(repoPath, "scan");
+    })
+    .catch((err) => {
+      log.debug("background status scan failed", { path: repoPath, message: err instanceof Error ? err.message : String(err) });
+    })
+    .finally(() => scanningRepos.delete(repoPath));
+}
+
+/**
  * DELETE /api/repos — stop tracking a repo. Always succeeds, even if the folder
  * is gone (issue #4: the desktop refused to remove a repo with a missing folder).
  */
@@ -513,7 +633,7 @@ async function deleteRepo(req, res) {
   if (!path) return sendJson(res, 400, { error: "path required" });
   unwatchRepo(path);
   const removed = store.removeRepo(path);
-  broadcastRefresh("*", "repos");
+  notifyChanged("*", "deleteRepo");
   sendJson(res, 200, { removed });
 }
 
@@ -541,8 +661,8 @@ async function streamOp(res, verb, globalArgs, args, repoPath) {
     res.write(JSON.stringify(ev) + "\n");
   }
   res.end();
-  // A mutating op changes repo state; tell every client to refetch.
-  if (repoPath) broadcastRefresh(repoPath, verb);
+  // A mutating op changes repo state; invalidate cache and tell every client to refetch.
+  if (repoPath) notifyChanged(repoPath, verb);
   log.info("stream op finished", { verb, ok });
 }
 
@@ -588,30 +708,33 @@ const server = createServer(async (req, res) => {
 
     if (p === "/api/history" && req.method === "GET") {
       const length = Number(q.get("length") ?? 50);
-      const events = await collect("revisionHistory", globalArgs, { length });
-      return sendJson(res, 200, { revisions: xform.history(events) });
+      const key = cache.repoKey(repoPath || "", `history:${length}`);
+      if (!repoPath) return sendJson(res, 400, { error: "path required" });
+      const revisions = await cache.cached(key, cache.TTL.repo, async () => {
+        const events = await collect("revisionHistory", globalArgs, { length });
+        return xform.history(events);
+      });
+      return sendJson(res, 200, { revisions });
     }
     if (p === "/api/status" && req.method === "GET") {
-      const events = await collect("repositoryStatus", globalArgs, { staged: true, scan: true });
-      const out = xform.status(events);
-      // The UI offers an "Initialize .loreignore" action when one is absent.
-      out.hasLoreignore = repoPath ? hasLoreignore(repoPath) : false;
-      out.hasGitignore = repoPath ? hasGitignore(repoPath) : false;
-      out.hasP4ignore = repoPath ? hasP4ignore(repoPath) : false;
-      // Flag entries that are themselves Lore working copies (a directory holding
-      // its own .lore). The UI prompts to ignore these *while they still exist* —
-      // the only way to avoid the unremovable "zombie" entry Lore leaves behind if
-      // an indexed nested repo is later deleted.
-      if (repoPath) {
-        for (const f of out.files) {
-          if (f.type === 0 && isRepo(join(repoPath, f.path))) f.nested = true;
-        }
-      }
+      if (!repoPath) return sendJson(res, 400, { error: "path required" });
+      const key = cache.repoKey(repoPath, "status");
+      const out = await cache.cached(key, cache.TTL.repo, async () => {
+        const data = await fetchStatus(repoPath, globalArgs, false);
+        data.scanning = true;
+        return data;
+      });
+      if (out.scanning) startBackgroundScan(repoPath, globalArgs, key);
       return sendJson(res, 200, out);
     }
     if (p === "/api/branches" && req.method === "GET") {
-      const events = await collect("branchList", globalArgs, {});
-      return sendJson(res, 200, { branches: xform.branches(events) });
+      if (!repoPath) return sendJson(res, 400, { error: "path required" });
+      const key = cache.repoKey(repoPath, "branches");
+      const branches = await cache.cached(key, cache.TTL.repo, async () => {
+        const events = await collect("branchList", globalArgs, {});
+        return xform.branches(events);
+      });
+      return sendJson(res, 200, { branches });
     }
     if (p === "/api/diff" && req.method === "GET") {
       const file = q.get("file");
@@ -639,13 +762,13 @@ const server = createServer(async (req, res) => {
     if (p === "/api/stage" && req.method === "POST") {
       const { path: rp, files } = await readBody(req);
       await collect("fileStage", { repositoryPath: rp }, { paths: absFiles(rp, files), scan: true });
-      broadcastRefresh(rp, "stage");
+      notifyChanged(rp, "stage");
       return sendJson(res, 200, { ok: true });
     }
     if (p === "/api/unstage" && req.method === "POST") {
       const { path: rp, files } = await readBody(req);
       await collect("fileUnstage", { repositoryPath: rp }, { paths: absFiles(rp, files) });
-      broadcastRefresh(rp, "unstage");
+      notifyChanged(rp, "unstage");
       return sendJson(res, 200, { ok: true });
     }
     if (p === "/api/reset" && req.method === "POST") {
@@ -654,7 +777,7 @@ const server = createServer(async (req, res) => {
       // it, fileReset only reverts already-tracked modified content and silently
       // leaves added entries dirty.
       await collect("fileReset", { repositoryPath: rp }, { paths: absFiles(rp, files), purge: true });
-      broadcastRefresh(rp, "reset");
+      notifyChanged(rp, "reset");
       return sendJson(res, 200, { ok: true });
     }
     // Add a file/folder/extension pattern to .loreignore (created if absent).
@@ -662,7 +785,7 @@ const server = createServer(async (req, res) => {
       const { path: rp, pattern } = await readBody(req);
       if (!rp || !pattern) return sendJson(res, 400, { error: "path and pattern required" });
       const added = appendIgnorePattern(toUnixPath(rp), pattern);
-      broadcastRefresh(rp, "ignore");
+      notifyChanged(rp, "ignore");
       return sendJson(res, 200, { ok: true, added });
     }
     // Seed/repair .loreignore for an already-initialized repo (the same setup the
@@ -671,7 +794,7 @@ const server = createServer(async (req, res) => {
       const { path: rp } = await readBody(req);
       if (!rp) return sendJson(res, 400, { error: "path required" });
       const result = setupLoreignore(toUnixPath(rp));
-      broadcastRefresh(rp, "ignore");
+      notifyChanged(rp, "ignore");
       return sendJson(res, 200, { ok: true, ...result });
     }
     // Rebuild a repo's .lore in place to purge unremovable zombie index entries
@@ -715,8 +838,21 @@ const server = createServer(async (req, res) => {
 // the user touches anything.
 function startWatchers() {
   for (const r of store.listRepos()) {
-    if (isRepo(r.path)) watchRepo(r.path, () => broadcastRefresh(r.path, "fs"));
+    if (isRepo(r.path)) watchRepo(r.path, () => notifyChanged(r.path, "fs"));
   }
+}
+
+/**
+ * Warm the repo-list cache in the background so the first browser request
+ * after a fresh server start can be served from cache instead of paying the
+ * full native enrichment cost. Best-effort — a failure here just means the
+ * first browser request warms the cache itself, as before.
+ */
+function warmRepoCache() {
+  const startedAt = Date.now();
+  enrichRepos()
+    .then(() => log.debug("repo cache warmed", { ms: Date.now() - startedAt }))
+    .catch((err) => log.debug("repo cache warmup failed", { message: err instanceof Error ? err.message : String(err) }));
 }
 
 server.on("error", (err) => {
@@ -730,6 +866,7 @@ server.on("error", (err) => {
 
 configureSdk();
 startWatchers();
+warmRepoCache();
 server.listen(PORT, HOST, () => {
   log.info("lore-web listening", { url: `http://${HOST}:${PORT}` });
 });

@@ -8,3 +8,4 @@ node_modules/
 # Lore files
 .lore/
 .loreignore
+/.claude

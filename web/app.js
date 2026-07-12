@@ -1390,6 +1390,12 @@ function wire() {
     loadBranches(encodeURIComponent(state.active));
   };
 
+  // Graph zoom/pan controls
+  const graphSvg = $("#branch-graph");
+  $("#graph-zoom-in").onclick = () => graph.zoomGraph(graphSvg, 1.1);
+  $("#graph-zoom-out").onclick = () => graph.zoomGraph(graphSvg, 1 / 1.1);
+  $("#graph-zoom-fit").onclick = () => graph.fitGraph(graphSvg);
+
   $("#merge-go").onclick = confirmMerge;
   $("#merge-cancel").onclick = () => $("#merge-dialog").close();
   $("#merge-dialog").addEventListener("cancel", (e) => {

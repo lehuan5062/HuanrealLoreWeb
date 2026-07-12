@@ -63,6 +63,9 @@ export function layoutGraph(graph, currentBranchId) {
     const branch = lanes[laneIdx];
     const history = histories[branch.id] || [];
     for (const rev of history) {
+      // Skip revisions already in nodeMap (shared with an earlier/parent lane)
+      if (nodeMap.has(rev.revision)) continue;
+
       const node = {
         revision: rev.revision,
         revisionNumber: rev.revisionNumber,
@@ -159,7 +162,13 @@ export function renderGraph(svgEl, layout, opts = {}) {
   const WIDTH = Math.max(300, lanes.length * LANE_WIDTH + PADDING * 2);
   const HEIGHT = Math.max(200, nodes.length * ROW_HEIGHT + PADDING * 2);
 
-  svgEl.setAttribute("viewBox", `0 0 ${WIDTH} ${HEIGHT}`);
+  // Preserve viewBox across re-renders if content size is stable
+  let view = svgEl._view;
+  if (!view || view.contentWidth !== WIDTH || view.contentHeight !== HEIGHT) {
+    view = { x: 0, y: 0, w: WIDTH, h: HEIGHT, contentWidth: WIDTH, contentHeight: HEIGHT };
+  }
+  svgEl._view = view;
+  svgEl.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
   svgEl.setAttribute("width", "100%");
   svgEl.setAttribute("height", "100%");
 
@@ -221,6 +230,8 @@ export function renderGraph(svgEl, layout, opts = {}) {
   }
 
   // Render nodes
+  const dragState = { startX: 0, startY: 0, dragged: false };
+
   for (const node of nodes) {
     const x = PADDING + node.lane * LANE_WIDTH + LANE_WIDTH / 2;
     const y = PADDING + nodes.indexOf(node) * ROW_HEIGHT + ROW_HEIGHT / 2;
@@ -250,7 +261,10 @@ export function renderGraph(svgEl, layout, opts = {}) {
     });
 
     if (onNodeClick) {
-      dot.addEventListener("click", (evt) => onNodeClick(node, evt));
+      dot.addEventListener("click", (evt) => {
+        if (!dragState.dragged) onNodeClick(node, evt);
+        dragState.dragged = false;
+      });
     }
 
     // Hover tooltip
@@ -282,7 +296,144 @@ export function renderGraph(svgEl, layout, opts = {}) {
     }
   }
 
+  // Zoom/pan interactions (only attach once per SVG element)
+  if (!svgEl._zoomAttached) {
+    svgEl._zoomAttached = true;
+    svgEl._dragState = dragState;
+    attachGraphInteractions(svgEl);
+  } else {
+    svgEl._dragState = dragState;
+  }
+
   // CSS for lane colors (defined inline in style.css)
+}
+
+/**
+ * Clamp a pan offset so some content always stays in view. When the view is
+ * wider/taller than the content (zoomed out), the range inverts — min/max of
+ * the two bounds keeps panning possible in both regimes instead of pinning
+ * the view to 0 (which made dragging a no-op at fit zoom).
+ */
+function clampPan(value, contentSize, viewSize) {
+  const lo = Math.min(0, contentSize - viewSize);
+  const hi = Math.max(0, contentSize - viewSize);
+  return Math.max(lo, Math.min(hi, value));
+}
+
+/** Attach wheel zoom, pointer drag, and touch interactions to the SVG. */
+function attachGraphInteractions(svgEl) {
+  // Wheel zoom at cursor
+  svgEl.addEventListener("wheel", (evt) => {
+    evt.preventDefault();
+    const view = svgEl._view;
+    if (!view) return;
+
+    const zoom = evt.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const rect = svgEl.getBoundingClientRect();
+    const cursorX = evt.clientX - rect.left;
+    const cursorY = evt.clientY - rect.top;
+    const svgCoordX = view.x + (cursorX / rect.width) * view.w;
+    const svgCoordY = view.y + (cursorY / rect.height) * view.h;
+
+    const newW = Math.max(view.contentWidth * 0.2, Math.min(view.contentWidth * 5, view.w / zoom));
+    const newH = (newW / view.w) * view.h;
+    const newX = svgCoordX - ((cursorX / rect.width) * newW);
+    const newY = svgCoordY - ((cursorY / rect.height) * newH);
+
+    view.w = newW;
+    view.h = newH;
+    view.x = clampPan(newX, view.contentWidth, newW);
+    view.y = clampPan(newY, view.contentHeight, newH);
+    svgEl.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+  });
+
+  // Drag to pan
+  let lastX = 0, lastY = 0;
+  svgEl.addEventListener("pointerdown", (evt) => {
+    evt.preventDefault(); // stop text-selection/native drag from eating the gesture
+    svgEl.setPointerCapture(evt.pointerId);
+    lastX = evt.clientX;
+    lastY = evt.clientY;
+    const dragState = svgEl._dragState;
+    if (dragState) {
+      dragState.startX = evt.clientX;
+      dragState.startY = evt.clientY;
+      dragState.dragged = false;
+    }
+    svgEl.style.cursor = "grabbing";
+  });
+
+  svgEl.addEventListener("pointermove", (evt) => {
+    if (evt.buttons === 0) return;
+    const view = svgEl._view;
+    if (!view) return;
+
+    const dx = evt.clientX - lastX;
+    const dy = evt.clientY - lastY;
+    const rect = svgEl.getBoundingClientRect();
+    const svgDX = -(dx / rect.width) * view.w;
+    const svgDY = -(dy / rect.height) * view.h;
+
+    view.x = clampPan(view.x + svgDX, view.contentWidth, view.w);
+    view.y = clampPan(view.y + svgDY, view.contentHeight, view.h);
+    svgEl.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+
+    lastX = evt.clientX;
+    lastY = evt.clientY;
+
+    const dragState = svgEl._dragState;
+    if (dragState) {
+      const moved = Math.hypot(evt.clientX - dragState.startX, evt.clientY - dragState.startY);
+      if (moved > 4) dragState.dragged = true;
+    }
+  });
+
+  svgEl.addEventListener("pointerup", (evt) => {
+    svgEl.style.cursor = "grab";
+  });
+
+  svgEl.addEventListener("pointercancel", () => {
+    svgEl.style.cursor = "grab";
+  });
+}
+
+/**
+ * Zoom the graph around the center of the view.
+ * @param {SVGElement} svgEl the graph SVG
+ * @param {number} factor zoom factor (e.g., 1.1 to zoom in, 1/1.1 to zoom out)
+ */
+export function zoomGraph(svgEl, factor) {
+  const view = svgEl._view;
+  if (!view) return;
+
+  const centerX = view.x + view.w / 2;
+  const centerY = view.y + view.h / 2;
+  const newW = Math.max(view.contentWidth * 0.2, Math.min(view.contentWidth * 5, view.w / factor));
+  const newH = (newW / view.w) * view.h;
+  view.x = centerX - newW / 2;
+  view.y = centerY - newH / 2;
+  view.w = newW;
+  view.h = newH;
+
+  // Clamp to content bounds
+  view.x = clampPan(view.x, view.contentWidth, view.w);
+  view.y = clampPan(view.y, view.contentHeight, view.h);
+
+  svgEl.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+}
+
+/**
+ * Fit the graph to show all content.
+ * @param {SVGElement} svgEl the graph SVG
+ */
+export function fitGraph(svgEl) {
+  const view = svgEl._view;
+  if (!view) return;
+  view.x = 0;
+  view.y = 0;
+  view.w = view.contentWidth;
+  view.h = view.contentHeight;
+  svgEl.setAttribute("viewBox", `0 0 ${view.contentWidth} ${view.contentHeight}`);
 }
 
 /**

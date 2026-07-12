@@ -253,3 +253,120 @@ test("layoutGraph dedupes branches by id, prefers LOCAL", () => {
   assert.equal(layout.lanes.length, 1);
   assert.equal(layout.lanes[0].location, 0);
 });
+
+test("layoutGraph dedupes shared fork-point revisions, attributes to parent lane", () => {
+  const graph = {
+    branches: [
+      {
+        id: "bid-1",
+        name: "main",
+        location: 0,
+        stack: [],
+        created: 100,
+      },
+      {
+        id: "bid-2",
+        name: "feature",
+        location: 0,
+        stack: [{ branch: "bid-1", revision: "r1" }],
+        created: 200,
+      },
+    ],
+    histories: {
+      "bid-1": [
+        {
+          revision: "r2",
+          revisionNumber: 2,
+          timestamp: 2000,
+          parent: ["r1"],
+        },
+        {
+          revision: "r1",
+          revisionNumber: 1,
+          timestamp: 1000,
+          parent: [],
+        },
+      ],
+      "bid-2": [
+        {
+          revision: "r3",
+          revisionNumber: 1,
+          timestamp: 1500,
+          parent: ["r1"],
+        },
+        {
+          revision: "r1",
+          revisionNumber: 1,
+          timestamp: 1000,
+          parent: [],
+        },
+      ],
+    },
+  };
+
+  const layout = layoutGraph(graph, "bid-1");
+  // r1 should appear only once (on main lane 0), not duplicated on feature lane 1
+  const r1Nodes = layout.nodes.filter((n) => n.revision === "r1");
+  assert.equal(r1Nodes.length, 1);
+  assert.equal(r1Nodes[0].lane, 0);
+  assert.equal(r1Nodes[0].branch, "main");
+
+  // r3 is feature's own node, should be on lane 1
+  const r3Node = layout.nodes.find((n) => n.revision === "r3");
+  assert(r3Node);
+  assert.equal(r3Node.lane, 1);
+
+  // Should have a linear edge from r3 to r1 (cross-lane)
+  const r3Edge = layout.edges.find((e) => e.from === "r3");
+  assert(r3Edge);
+  assert.equal(r3Edge.to, "r1");
+});
+
+test("layoutGraph child branch with entirely shared history yields zero own nodes", () => {
+  const graph = {
+    branches: [
+      {
+        id: "bid-1",
+        name: "main",
+        location: 0,
+        stack: [],
+        created: 100,
+      },
+      {
+        id: "bid-2",
+        name: "merged",
+        location: 0,
+        stack: [{ branch: "bid-1", revision: "r1" }],
+        created: 200,
+      },
+    ],
+    histories: {
+      "bid-1": [
+        {
+          revision: "r1",
+          revisionNumber: 1,
+          timestamp: 1000,
+          parent: [],
+        },
+      ],
+      "bid-2": [
+        {
+          revision: "r1",
+          revisionNumber: 1,
+          timestamp: 1000,
+          parent: [],
+        },
+      ],
+    },
+  };
+
+  const layout = layoutGraph(graph, "bid-1");
+  // Two lanes exist
+  assert.equal(layout.lanes.length, 2);
+  // Only one node total (r1 on main lane)
+  assert.equal(layout.nodes.length, 1);
+  const node = layout.nodes[0];
+  assert.equal(node.revision, "r1");
+  assert.equal(node.lane, 0);
+  assert.equal(node.branch, "main");
+});

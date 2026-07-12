@@ -42,9 +42,10 @@ the server was down.
 
 | Method | Path | Query | Description |
 | --- | --- | --- | --- |
-| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `hasLoreignore`, `hasGitignore`, and `hasP4ignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. The full working-tree scan (which discovers untracked files, and can take seconds on a large working copy) does not block the response: the first read after a repo switch returns with `scanning: true` and only staged/tracked changes, then the scan completes in the background and an `/events` refresh tells the SPA to refetch the complete list. |
+| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `inMerge` (true when actively merging), `conflicts` (count of unresolved files), `revisionMerged` (merge parent hash), and `revisionStaged`. The status also includes `hasLoreignore`, `hasGitignore`, and `hasP4ignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. The full working-tree scan (which discovers untracked files, and can take seconds on a large working copy) does not block the response: the first read after a repo switch returns with `scanning: true` and only staged/tracked changes, then the scan completes in the background and an `/events` refresh tells the SPA to refetch the complete list. |
 | GET | `/api/history` | `path`, `length` | Revision history (default 50), with message and timestamp. |
-| GET | `/api/branches` | `path` | Branch list. |
+| GET | `/api/branches` | `path`, `archived?` | Branch list. Each branch has `id`, `name`, `location` (`LOCAL`/`REMOTE`), `category`, `latest` (tip revision), `stack` (fork point parents), `creator`, `created`, `isCurrent`, and `archived`. Pass `archived=true` to include archived branches. |
+| GET | `/api/graph` | `path`, `length?` | Branch graph for visualization: `{ branches, histories }`. `histories` is a map of `branchId` to per-branch revision arrays (default length 100 per branch). Branches deduplicated by id, preferring `LOCAL`. Gracefully degrades: a failing per-branch history becomes an empty array, not a graph error. |
 | GET | `/api/diff` | `path`, `file` | Unified diff for one file. |
 | GET | `/api/auth` | — | `{ loggedIn }` — whether the CLI has a stored identity. |
 | GET | `/api/org` | `path` | `{ organization, repoName, name }` for a repo. The organization is the prefix of the repo's `name` metadata (`org/repo`); `repoName` is the part after the slash. `organization` is empty when the name has no slash. |
@@ -62,6 +63,10 @@ the server was down.
 | POST | `/api/init-loreignore` | `{ path }` | Set up `.loreignore` (seeded from `.gitignore` and `.p4ignore` when present) and keep each tool's metadata out of the other's history. Returns `{ ok, created, gitignoreUpdated, gitignoreBlocked, p4ignoreUpdated, p4ignoreBlocked }`. A `*Blocked` flag is `true` when that ignore file exists but is read-only (Perforce keeps `.p4ignore` read-only until `p4 edit`), so Lore's entries could not be added — seeding `.loreignore` still succeeds. |
 | POST | `/api/repair` | `{ path }` | Rebuild the working copy's `.lore` in place to purge unremovable stale index entries, preserving the repository id and remote. Refused (409) when there is committed history. Returns `{ ok, id }`. |
 | POST | `/api/org` | `{ path, organization }` | Change a repo's organization. A repo's org is the `org/` prefix of its `name`, which Lore makes read-only after creation, so this rebuilds the working copy's `.lore` under a new URL (preserving the repository id and remote), which discards local committed revisions. The caller must confirm that loss first. `organization` cannot be empty or contain a slash. Returns `{ organization, repoName, name, id }`. |
+| POST | `/api/branch/create` | `{ path, branch, category? }` | Create a new branch. Returns `{ branch }` with the full branch object. |
+| POST | `/api/branch/archive` | `{ path, branch }` | Archive a branch. Returns `{ ok: true }`. Refused (409) if archiving the current branch. |
+| POST | `/api/merge/abort` | `{ path }` | Abort an in-progress merge. Returns `{ ok: true }`. |
+| POST | `/api/merge/resolve` | `{ path, mode, paths }` | Resolve conflicts for files in a merge. `mode` is one of: `mine` (keep local), `theirs` (accept remote), `manual` (mark as manually resolved), `unresolve` (mark as unresolved), `restart` (redo merge). `paths` is relative to the working root. Returns `{ ok: true }`. |
 
 ### Streamed operations
 
@@ -76,6 +81,8 @@ file and byte counts, which the web UI renders as a progress bar.
 | POST | `/api/sync` | `{ path, revision?, reset? }` | Sync the working copy to a revision. |
 | POST | `/api/push` | `{ path, branch?, fastForwardMerge? }` | Push commits to the remote. |
 | POST | `/api/clone` | `{ url, dest }` | Clone a remote repository into `dest`. |
+| POST | `/api/branch/switch` | `{ path, branch, revision?, reset? }` | Switch to a branch, materializing files. Pass `reset: true` to discard working changes. Optional `revision` to switch to a specific revision on the branch. |
+| POST | `/api/merge/start` | `{ path, branch, message?, noCommit? }` | Begin merging a branch into the current branch. Emits `BRANCH_MERGE_CONFLICT_FILE` per file with unresolved conflicts, then `BRANCH_MERGE_START_END { hasConflicts }`. Use `/api/merge/resolve` to resolve conflicts, then `/api/commit` to finalize (or `/api/merge/abort` to cancel). |
 
 ### Events
 

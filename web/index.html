@@ -55,6 +55,19 @@
             <div class="panel active" data-panel="changes">
               <div class="changes-layout">
                 <div class="changes-bar" hidden></div>
+                <div id="merge-banner" class="merge-banner" hidden>
+                  <div class="merge-status">
+                    <span id="merge-status-text">Merging…</span>
+                  </div>
+                  <div class="merge-actions">
+                    <button id="merge-complete-btn" class="primary">Complete merge</button>
+                    <button id="merge-abort-btn" class="ghost">Abort</button>
+                  </div>
+                </div>
+                <div id="conflicts-section" class="conflicts-section" hidden>
+                  <h3>Conflicts <span id="conflict-count" class="conflict-badge">0</span></h3>
+                  <ul id="conflicts-list" class="conflicts-list"></ul>
+                </div>
                 <div class="file-cols">
                   <div class="file-col">
                     <h3>Staged</h3>
@@ -80,7 +93,21 @@
 
             <!-- Branches -->
             <div class="panel" data-panel="branches">
-              <ul id="branch-list" class="branches"></ul>
+              <div class="branches-layout">
+                <div class="branch-sidebar">
+                  <div class="branch-controls">
+                    <button id="new-branch-btn" class="primary">New branch</button>
+                    <label class="show-archived-label">
+                      <input id="show-archived-check" type="checkbox" />
+                      <span>Show archived</span>
+                    </label>
+                  </div>
+                  <ul id="branch-list" class="branch-list"></ul>
+                </div>
+                <div class="graph-wrap">
+                  <svg id="branch-graph" class="branch-graph"></svg>
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -225,6 +252,49 @@
         </menu>
       </form>
     </dialog>
+
+    <!-- Create branch dialog -->
+    <dialog id="create-branch-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Create branch</h3>
+        <label>Branch name
+          <input id="create-branch-name" type="text" placeholder="feature-name" autofocus />
+        </label>
+        <label>Category
+          <input id="create-branch-category" type="text" placeholder="user" />
+        </label>
+        <menu>
+          <button type="button" id="create-branch-cancel">Cancel</button>
+          <button type="button" id="create-branch-go" class="primary">Create</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <!-- Merge dialog -->
+    <dialog id="merge-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Merge into current branch</h3>
+        <label>Source branch
+          <select id="merge-source">
+            <option value="">— Select branch —</option>
+          </select>
+        </label>
+        <label>Commit message
+          <textarea id="merge-message" placeholder="Merge message (optional)"></textarea>
+        </label>
+        <label>
+          <input id="merge-no-commit-check" type="checkbox" />
+          <span>No auto-commit (leave staged for review)</span>
+        </label>
+        <menu>
+          <button type="button" id="merge-cancel">Cancel</button>
+          <button type="button" id="merge-go" class="primary">Merge</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <!-- Node popover (graph node actions) -->
+    <div id="node-popover" class="node-popover" hidden></div>
 
     <div id="toast" class="toast" hidden></div>
     <script type="module" src="/app.js"></script>

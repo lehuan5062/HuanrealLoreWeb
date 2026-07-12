@@ -45,8 +45,13 @@ collaborator who syncs with your server but runs no server of their own.
    folder. (Already-cloned repos are tagged, and each row's ✕ deletes that
    repository from the server.) To clone a known URL directly instead, use
    **Clone from URL…**.
-5. Work normally. Use **Push** to send commits to the host and **Sync** to pull
-   the host's latest revision. Progress streams live in the dialog.
+5. Work normally:
+   - Use **Push** to send commits to the host and **Sync** to pull the host's
+     latest revision. Progress streams live in the dialog.
+   - View the **Branches** tab to see a visual branch/commit graph. Click any
+     revision in the graph or history list to sync the working copy to that point.
+     Click a branch row's **Switch** to change branches or **Merge** to merge another
+     branch in.
 
 ## Change a repository's organization
 

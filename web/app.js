@@ -4,6 +4,8 @@
 // instant, and TTL bounds staleness for changes the watcher cannot see. A brief
 // stale view is acceptable; the SSE refresh corrects it moments later.
 
+import * as graph from "./graph.js";
+
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
@@ -14,6 +16,8 @@ const state = {
   selectedFile: null,
   defaultRemote: "",
   discoveredServers: [],
+  branches: [],
+  graphSig: null,
 };
 
 async function apiGet(path) {
@@ -273,6 +277,13 @@ async function loadStatus(pathEnc) {
     const data = await apiGet(`/api/status?path=${pathEnc}`);
     if (state.active !== forPath) return;
     $("#repo-branch").textContent = data.branch || "";
+
+    // Store status for use in graph rendering and popover
+    state.status = data;
+
+    // Render merge UI if in merge
+    renderMergeUI(data);
+
     const staged = data.files.filter((f) => f.flagStaged);
     const unstaged = data.files.filter((f) => !f.flagStaged);
     renderFiles($("#staged-files"), staged, "unstage");
@@ -281,6 +292,97 @@ async function loadStatus(pathEnc) {
     $("#stage-all-btn").disabled = unstaged.length === 0;
     state.unstaged = unstaged;
     updateChangesBar(data);
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function renderMergeUI(statusData) {
+  const banner = $("#merge-banner");
+  const conflictsSection = $("#conflicts-section");
+
+  if (!statusData.inMerge) {
+    banner.hidden = true;
+    conflictsSection.hidden = true;
+    return;
+  }
+
+  banner.hidden = false;
+
+  // Get conflicts from files
+  const conflicts = statusData.files.filter((f) => f.flagConflictUnresolved);
+
+  if (conflicts.length > 0) {
+    conflictsSection.hidden = false;
+    $("#conflict-count").textContent = conflicts.length;
+    renderConflicts(conflicts);
+  } else {
+    conflictsSection.hidden = true;
+  }
+
+  // Update merge status text
+  const branch = statusData.branch || "unknown";
+  $("#merge-status-text").textContent = `Merging into ${branch}${conflicts.length > 0 ? ` — ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}` : " — all resolved"}`;
+}
+
+function renderConflicts(conflicts) {
+  const ul = $("#conflicts-list");
+  ul.innerHTML = "";
+
+  for (const f of conflicts) {
+    const li = document.createElement("li");
+    li.innerHTML = `
+      <span class="conflict-path" title="${f.path}">${f.path}</span>
+      <div class="conflict-actions">
+        <button class="c-mine" title="Keep local">Mine</button>
+        <button class="c-theirs" title="Accept remote">Theirs</button>
+        <button class="c-mark" title="Mark as manually resolved">Mark resolved</button>
+        <button class="c-diff" title="Show diff">Diff</button>
+      </div>`;
+
+    li.querySelector(".c-mine").onclick = () => resolveConflict(f.path, "mine");
+    li.querySelector(".c-theirs").onclick = () => resolveConflict(f.path, "theirs");
+    li.querySelector(".c-mark").onclick = () => resolveConflict(f.path, "manual");
+    li.querySelector(".c-diff").onclick = () => showDiff(f.path);
+
+    ul.appendChild(li);
+  }
+}
+
+async function resolveConflict(path, mode) {
+  try {
+    await apiPost("/api/merge/resolve", {
+      path: state.active,
+      mode,
+      paths: [path],
+    });
+    toast(`Resolved ${path} (${mode})`);
+    await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function completeMerge() {
+  const ok = confirm("Complete merge? This will commit all staged changes.");
+  if (!ok) return;
+  const msg = "Merge completed";
+  try {
+    await apiPost("/api/commit", { path: state.active, message: msg });
+    toast("Merge completed");
+    await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function abortMerge() {
+  const ok = confirm("Abort merge? This will discard all staged changes.");
+  if (!ok) return;
+  try {
+    await apiPost("/api/merge/abort", { path: state.active });
+    toast("Merge aborted");
+    await loadStatus(encodeURIComponent(state.active));
   } catch (err) {
     toast(err.message, true);
   }
@@ -543,10 +645,15 @@ async function loadHistory(pathEnc) {
           <div class="h-meta">
             <span class="h-rev">#${r.revisionNumber} · ${(r.revision || "").slice(0, 12)}</span>
             <span>${when}</span>
+            <button class="h-sync" title="Sync to this revision">Sync</button>
           </div>
         </div>
         <div class="rev-detail" hidden></div>`;
       li.querySelector(".h-row").onclick = () => toggleRevision(r, li);
+      li.querySelector(".h-sync").onclick = (evt) => {
+        evt.stopPropagation();
+        syncToRevision(r);
+      };
       if (r.revision === state.openRevision) toggleRevision(r, li);
       ul.appendChild(li);
     }
@@ -614,24 +721,146 @@ async function showRevisionFileDiff(r, parent, file, detail) {
 async function loadBranches(pathEnc) {
   const forPath = state.active;
   try {
-    const { branches } = await apiGet(`/api/branches?path=${pathEnc}`);
+    const showArchived = $("#show-archived-check")?.checked ?? false;
+    const graphData = await apiGet(`/api/graph?path=${pathEnc}&length=100`);
     if (state.active !== forPath) return;
+
+    // Dedupe branches by id, preferring LOCAL
+    const deduped = graph.dedupeBranches(graphData.branches);
+    state.branches = deduped;
+
+    // Filter branches (active or archived)
+    const branches = deduped.filter((b) => showArchived || !b.archived);
+    const currentBranch = branches.find((b) => b.isCurrent);
+
+    // Populate merge source select
+    const mergeSelect = $("#merge-source");
+    if (mergeSelect) {
+      const options = branches.filter((b) => !b.isCurrent);
+      mergeSelect.innerHTML = '<option value="">— Select branch —</option>';
+      for (const b of options) {
+        const opt = document.createElement("option");
+        opt.value = b.id;
+        opt.textContent = b.name;
+        mergeSelect.appendChild(opt);
+      }
+    }
+
+    // Render sidebar
     const ul = $("#branch-list");
     ul.innerHTML = "";
-    const seen = new Set();
     for (const b of branches) {
-      if (seen.has(b.name)) continue; // local + remote entries share a name
-      seen.add(b.name);
       const li = document.createElement("li");
+      li.className = b.isCurrent ? "current" : "";
       li.innerHTML = `
-        <span class="b-current">${b.isCurrent ? "●" : "○"}</span>
-        <span class="b-name">${b.name}</span>
-        <span class="b-loc">${(b.latest || "").slice(0, 12)}</span>`;
+        <div class="b-head">
+          <span class="b-current-dot">${b.isCurrent ? "●" : "○"}</span>
+          <span class="b-name" title="${b.name}">${b.name}</span>
+        </div>
+        <div class="b-cat">${b.category || "—"}</div>
+        <div class="b-meta">
+          <span class="b-creator">${b.creator || "?"}</span>
+          <span>${(b.latest || "").slice(0, 12)}</span>
+        </div>
+        <div class="b-actions">
+          ${!b.isCurrent ? `<button class="b-switch" title="Switch to branch">Switch</button>` : ""}
+          ${!b.isCurrent ? `<button class="b-merge" title="Merge into current">Merge</button>` : ""}
+          ${!b.isCurrent ? `<button class="b-archive" title="Archive branch">Archive</button>` : ""}
+        </div>`;
       ul.appendChild(li);
+      if (!b.isCurrent) {
+        li.querySelector(".b-switch")?.addEventListener("click", () => switchBranch(b));
+        li.querySelector(".b-merge")?.addEventListener("click", () => startMerge(b));
+        li.querySelector(".b-archive")?.addEventListener("click", () => archiveBranch(b));
+      }
+    }
+
+    // Render graph (if any nodes)
+    if (graphData.branches.length > 0) {
+      const layout = graph.layoutGraph(graphData, currentBranch?.id);
+      const sig = graph.layoutSignature(layout);
+      if (state.graphSig !== sig) {
+        state.graphSig = sig;
+        graph.renderGraph($("#branch-graph"), layout, {
+          onNodeClick: (node, evt) => showNodePopover(node, evt),
+          currentRevision: state.status?.revision,
+        });
+      }
     }
   } catch (err) {
     toast(err.message, true);
   }
+}
+
+async function createBranch() {
+  const name = $("#create-branch-name")?.value?.trim();
+  const category = $("#create-branch-category")?.value?.trim() || "user";
+  if (!name) {
+    toast("Branch name required", true);
+    return;
+  }
+  try {
+    await apiPost("/api/branch/create", {
+      path: state.active,
+      branch: name,
+      category,
+    });
+    toast(`Created branch ${name}`);
+    await loadBranches(encodeURIComponent(state.active));
+    $("#create-branch-dialog")?.close?.();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function switchBranch(branch) {
+  const pathEnc = encodeURIComponent(state.active);
+  if (state.unstaged?.length > 0) {
+    const ok = confirm("Working tree has unstaged changes. Continue switch?");
+    if (!ok) return;
+  }
+  await runOp(`Switch to ${branch.name}`, "/api/branch/switch", {
+    path: state.active,
+    branch: branch.name,
+  });
+}
+
+async function archiveBranch(branch) {
+  const ok = confirm(`Archive branch ${branch.name}?`);
+  if (!ok) return;
+  try {
+    await apiPost("/api/branch/archive", {
+      path: state.active,
+      branch: branch.name,
+    });
+    toast(`Archived ${branch.name}`);
+    await loadBranches(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function startMerge(branch) {
+  $("#merge-source").value = branch.id;
+  $("#merge-dialog")?.showModal?.();
+}
+
+async function confirmMerge() {
+  const sourceId = $("#merge-source")?.value;
+  const sourceBranch = state.branches?.find((b) => b.id === sourceId);
+  if (!sourceBranch) {
+    toast("Select a source branch", true);
+    return;
+  }
+  const message = $("#merge-message")?.value?.trim() || "";
+  const noCommit = $("#merge-no-commit-check")?.checked ?? false;
+  $("#merge-dialog").close();
+  await runOp(`Merge ${sourceBranch.name}`, "/api/merge/start", {
+    path: state.active,
+    branch: sourceBranch.name,
+    message,
+    noCommit,
+  });
 }
 
 /** Format a byte count as a short human-readable string, for example "42.1 MB".
@@ -718,6 +947,90 @@ async function runOp(title, path, payload) {
   }
   closeBtn.hidden = false;
   await refreshActive();
+}
+
+async function syncToRevision(revision) {
+  const pathEnc = encodeURIComponent(state.active);
+  if (state.unstaged?.length > 0) {
+    const ok = confirm(`Working tree has ${state.unstaged.length} unstaged change${state.unstaged.length === 1 ? "" : "s"}. Continue sync?`);
+    if (!ok) return;
+  }
+  await runOp(`Syncing to #${revision.revisionNumber}…`, "/api/sync", {
+    path: state.active,
+    revision: revision.revision,
+  });
+}
+
+function showNodePopover(node, evt) {
+  const popover = $("#node-popover");
+  const currentBranch = state.branches?.find((b) => b.isCurrent);
+  const isDifferentBranch = node.branchId !== currentBranch?.id;
+  const shortHash = (node.revision || "").slice(0, 12);
+  const when = node.timestamp ? new Date(node.timestamp).toLocaleString() : "";
+
+  let syncButton = "";
+  if (isDifferentBranch) {
+    syncButton = `<button class="pop-action" disabled title="Switch to ${node.branch} first">Sync to this revision</button>`;
+  } else {
+    syncButton = `<button class="pop-action pop-sync">Sync to this revision</button>`;
+  }
+
+  popover.innerHTML = `
+    <div class="pop-header">
+      <span class="pop-branch">${node.branch}</span>
+      <span class="pop-rev">#${node.revisionNumber}</span>
+    </div>
+    <div class="pop-content">
+      <div class="pop-hash" title="${node.revision}">${shortHash}</div>
+      <div class="pop-msg">${(node.message || "(no message)").split("\n")[0]}</div>
+      <div class="pop-time">${when}</div>
+    </div>
+    <div class="pop-actions">
+      ${syncButton}
+      <button class="pop-action pop-copy">Copy hash</button>
+    </div>`;
+
+  popover.hidden = false;
+
+  // Position popover near the click
+  const rect = popover.getBoundingClientRect();
+  let x = evt.clientX;
+  let y = evt.clientY + 8;
+  if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 8;
+  if (y + rect.height > window.innerHeight) y = evt.clientY - rect.height - 8;
+  popover.style.left = Math.max(8, x) + "px";
+  popover.style.top = Math.max(8, y) + "px";
+
+  // Sync action
+  popover.querySelector(".pop-sync")?.addEventListener("click", () => {
+    popover.hidden = true;
+    syncToRevision(node);
+  });
+
+  // Copy hash action
+  popover.querySelector(".pop-copy")?.addEventListener("click", () => {
+    navigator.clipboard.writeText(node.revision);
+    toast("Hash copied");
+    popover.hidden = true;
+  });
+
+  // Dismiss on outside click
+  const dismissOnClick = (e) => {
+    if (!popover.contains(e.target) && e.target !== evt.target && !evt.target?.contains?.(e.target)) {
+      popover.hidden = true;
+      document.removeEventListener("click", dismissOnClick);
+    }
+  };
+  setTimeout(() => document.addEventListener("click", dismissOnClick), 0);
+
+  // Dismiss on Esc
+  const dismissOnEsc = (e) => {
+    if (e.key === "Escape") {
+      popover.hidden = true;
+      document.removeEventListener("keydown", dismissOnEsc);
+    }
+  };
+  document.addEventListener("keydown", dismissOnEsc);
 }
 
 /** Scheduler that coalesces overlapping refresh requests (focus, SSE, poll) into a single debounced update. */
@@ -1055,6 +1368,41 @@ function wire() {
     e.preventDefault();
     $("#settings-dialog").close();
   });
+
+  // Branch management
+  $("#new-branch-btn").onclick = () => {
+    $("#create-branch-name").value = "";
+    $("#create-branch-category").value = "user";
+    $("#create-branch-dialog").showModal();
+    $("#create-branch-name").focus();
+  };
+  $("#create-branch-go").onclick = createBranch;
+  $("#create-branch-cancel").onclick = () => $("#create-branch-dialog").close();
+  $("#create-branch-dialog").addEventListener("cancel", (e) => {
+    e.preventDefault();
+    $("#create-branch-dialog").close();
+  });
+  $("#create-branch-name").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") createBranch();
+  });
+
+  $("#show-archived-check").onchange = () => {
+    loadBranches(encodeURIComponent(state.active));
+  };
+
+  $("#merge-go").onclick = confirmMerge;
+  $("#merge-cancel").onclick = () => $("#merge-dialog").close();
+  $("#merge-dialog").addEventListener("cancel", (e) => {
+    e.preventDefault();
+    $("#merge-dialog").close();
+  });
+  $("#merge-message").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.ctrlKey) confirmMerge();
+  });
+
+  // Merge conflict resolution buttons
+  $("#merge-complete-btn").onclick = completeMerge;
+  $("#merge-abort-btn").onclick = abortMerge;
 
   wirePicker();
   wireInit();

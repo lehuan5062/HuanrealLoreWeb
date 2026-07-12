@@ -80,7 +80,96 @@ test("branches keeps only BRANCH_LIST_ENTRY events", () => {
     ev("BRANCH_LIST_ENTRY", { name: "main" }),
     ev("BRANCH_LIST_END", {}),
   ];
-  assert.deepEqual(xform.branches(events), [{ name: "main" }]);
+  const result = xform.branches(events);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].name, "main");
+});
+
+test("branches returns full stable shape", () => {
+  const events = [
+    ev("BRANCH_LIST_ENTRY", {
+      id: "bid-1",
+      location: 0,
+      name: "main",
+      category: "default",
+      latest: "abc123",
+      stack: [],
+      creator: "user1",
+      created: 1234567890,
+      isCurrent: true,
+      archived: false,
+    }),
+  ];
+  const result = xform.branches(events);
+  assert.equal(result[0].id, "bid-1");
+  assert.equal(result[0].location, 0);
+  assert.equal(result[0].latest, "abc123");
+  assert.deepEqual(result[0].stack, []);
+  assert.equal(result[0].isCurrent, true);
+  assert.equal(result[0].archived, false);
+});
+
+test("status includes merge-related fields", () => {
+  const events = [
+    ev("REPOSITORY_STATUS_REVISION", {
+      branchName: "main",
+      revision: "abc123",
+      revisionMerged: "def456",
+      revisionStaged: "stg789",
+    }),
+  ];
+  const s = xform.status(events);
+  assert.equal(s.revisionMerged, "def456");
+  assert.equal(s.revisionStaged, "stg789");
+});
+
+test("status detects inMerge when revisionMerged is non-zero hash", () => {
+  const events = [
+    ev("REPOSITORY_STATUS_REVISION", {
+      branchName: "main",
+      revision: "abc123",
+      revisionMerged: "nonzerodef456",
+    }),
+  ];
+  const s = xform.status(events);
+  assert.equal(s.inMerge, true);
+});
+
+test("status treats empty string as not inMerge", () => {
+  const s = xform.status([
+    ev("REPOSITORY_STATUS_REVISION", {
+      branchName: "main",
+      revision: "abc123",
+      revisionMerged: "",
+    }),
+  ]);
+  assert.equal(s.inMerge, false);
+});
+
+test("status treats 64-char all-zeros hash as not inMerge", () => {
+  const s = xform.status([
+    ev("REPOSITORY_STATUS_REVISION", {
+      branchName: "main",
+      revision: "abc123",
+      revisionMerged: "0000000000000000000000000000000000000000000000000000000000000000",
+    }),
+  ]);
+  assert.equal(s.inMerge, false);
+});
+
+test("status counts unresolved conflicts", () => {
+  const events = [
+    ev("REPOSITORY_STATUS_REVISION", {
+      branchName: "main",
+      revision: "abc123",
+      revisionMerged: "",
+    }),
+    ev("REPOSITORY_STATUS_FILE", { path: "a.txt", flagConflictUnresolved: true }),
+    ev("REPOSITORY_STATUS_FILE", { path: "b.txt", flagConflictUnresolved: true }),
+    ev("REPOSITORY_STATUS_FILE", { path: "c.txt", flagConflictUnresolved: false }),
+  ];
+  const s = xform.status(events);
+  assert.equal(s.conflicts, 2);
 });
 
 test("remoteRepos keeps only REPOSITORY_LIST_ENTRY events", () => {

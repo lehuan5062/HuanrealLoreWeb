@@ -13,6 +13,15 @@ It runs identically on two kinds of machine:
   `push` against a host's server over the network. It needs only the SDK
   dependency and a one-time `lore login`.
 
+## Features
+
+- **Live refresh** — repository and revision lists update instantly on disk changes
+  or after any action, with no manual cache clear.
+- **Visual branch graph** — see all branches and commits as an interactive graph;
+  click any revision to sync the working copy to it.
+- **Branch management** — create, switch, archive, and merge branches directly
+  from the web UI, with conflict resolution for merge conflicts.
+
 ## Why this exists
 
 The official desktop app persists its entire UI state to SQLite and rehydrates

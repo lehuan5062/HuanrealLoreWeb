@@ -45,24 +45,51 @@ export function history(events) {
 export function status(events) {
   let branch = null;
   let revision = null;
+  let revisionMerged = null;
+  let revisionStaged = null;
   const files = [];
   let summary = null;
   for (const e of events) {
     if (e.tag === "REPOSITORY_STATUS_REVISION") {
       branch = e.data?.branchName ?? branch;
       revision = e.data?.revision ?? revision;
+      revisionMerged = e.data?.revisionMerged ?? revisionMerged;
+      revisionStaged = e.data?.revisionStaged ?? revisionStaged;
     } else if (e.tag === "REPOSITORY_STATUS_FILE") {
       files.push(e.data);
     } else if (e.tag === "REPOSITORY_STATUS_SUMMARY") {
       summary = e.data;
     }
   }
-  return { branch, revision, files, summary };
+  // Count unresolved conflicts
+  const conflicts = files.filter((f) => f.flagConflictUnresolved).length;
+  // inMerge: non-zero hash (SHA-256 is 64 hex chars, all zeros = no merge)
+  const isZeroHash = (h) => !h || /^0+$/.test(h);
+  const inMerge = !isZeroHash(revisionMerged);
+  return { branch, revision, revisionMerged, revisionStaged, files, summary, inMerge, conflicts };
 }
 
-/** @param {LoreEvt[]} events */
+/**
+ * Transform branch list events into full stable shape with id, location,
+ * category, creator, created, isCurrent, archived, stack, and latest revision.
+ * @param {LoreEvt[]} events
+ */
 export function branches(events) {
-  return events.filter((e) => e.tag === "BRANCH_LIST_ENTRY").map((e) => e.data);
+  return events.filter((e) => e.tag === "BRANCH_LIST_ENTRY").map((e) => {
+    const b = e.data || {};
+    return {
+      id: b.id,
+      location: b.location,
+      name: b.name,
+      category: b.category,
+      latest: b.latest,
+      stack: b.stack || [],
+      creator: b.creator,
+      created: b.created,
+      isCurrent: b.isCurrent,
+      archived: b.archived,
+    };
+  });
 }
 
 /**
@@ -90,6 +117,17 @@ export function diff(events) {
   return events
     .filter((e) => e.tag === "FILE_DIFF" || e.tag === "REVISION_DIFF_FILE")
     .map((e) => e.data);
+}
+
+/**
+ * Collect per-branch history entries keyed by branchId for the graph view.
+ * Used in parallel with branchList to build branches + per-branch histories.
+ * @param {string} branchId the branch to collect for
+ * @param {LoreEvt[]} events from revisionHistory for that branch
+ * @returns {object[]} revision entries for that branch
+ */
+export function graphHistory(events) {
+  return history(events);
 }
 
 /** Repositories a server hosts, from `repositoryList`. @param {LoreEvt[]} events */

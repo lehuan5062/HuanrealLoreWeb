@@ -729,13 +729,108 @@ const server = createServer(async (req, res) => {
     }
     if (p === "/api/branches" && req.method === "GET") {
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
-      const key = cache.repoKey(repoPath, "branches");
+      const archived = q.get("archived") === "true";
+      const key = cache.repoKey(repoPath, `branches:${archived ? "all" : "active"}`);
       const branches = await cache.cached(key, cache.TTL.repo, async () => {
-        const events = await collect("branchList", globalArgs, {});
+        const events = await collect("branchList", globalArgs, { archived });
         return xform.branches(events);
       });
       return sendJson(res, 200, { branches });
     }
+
+    if (p === "/api/graph" && req.method === "GET") {
+      if (!repoPath) return sendJson(res, 400, { error: "path required" });
+      const length = Number(q.get("length") ?? 100);
+      const key = cache.repoKey(repoPath, `graph:${length}`);
+      const graph = await cache.cached(key, cache.TTL.repo, async () => {
+        const branchEvents = await collect("branchList", globalArgs, {});
+        const branches = xform.branches(branchEvents);
+        const histories = {};
+        // Fetch per-branch history in parallel, degrading gracefully
+        await Promise.all(
+          branches.map((b) =>
+            collect("revisionHistory", globalArgs, {
+              branch: b.name,
+              length,
+              onlyBranch: true,
+            })
+              .then((events) => {
+                histories[b.id] = xform.graphHistory(events);
+              })
+              .catch((err) => {
+                log.debug("graph history fetch failed", { branch: b.name, message: err instanceof Error ? err.message : String(err) });
+                histories[b.id] = [];
+              })
+          )
+        );
+        return { branches, histories };
+      });
+      return sendJson(res, 200, graph);
+    }
+    // Branch mutations: quick ops that return immediately
+    if (p === "/api/branch/create" && req.method === "POST") {
+      const { path: rp, branch, category } = await readBody(req);
+      if (!rp || !branch) return sendJson(res, 400, { error: "path and branch required" });
+      const events = await collect("branchCreate", { repositoryPath: rp }, { branch, category: category || "" });
+      const branches = xform.branches(events);
+      notifyChanged(rp, "branchCreate");
+      return sendJson(res, 200, { branch: branches[0] || null });
+    }
+
+    if (p === "/api/branch/archive" && req.method === "POST") {
+      const { path: rp, branch } = await readBody(req);
+      if (!rp || !branch) return sendJson(res, 400, { error: "path and branch required" });
+      await collect("branchArchive", { repositoryPath: rp }, { branch });
+      notifyChanged(rp, "branchArchive");
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // Branch switch: streaming op (materializes files, can be slow)
+    if (p === "/api/branch/switch" && req.method === "POST") {
+      const { path: rp, branch, revision, reset } = await readBody(req);
+      if (!rp || !branch) return sendJson(res, 400, { error: "path and branch required" });
+      const args = { branch, reset: !!reset };
+      if (revision) args.revision = revision;
+      return await streamOp(res, "branchSwitch", { repositoryPath: rp }, args, rp);
+    }
+
+    // Merge operations
+    if (p === "/api/merge/start" && req.method === "POST") {
+      const { path: rp, branch, message, noCommit } = await readBody(req);
+      if (!rp || !branch) return sendJson(res, 400, { error: "path and branch required" });
+      const args = { branch, noCommit: !!noCommit };
+      if (message) args.message = message;
+      return await streamOp(res, "branchMergeStart", { repositoryPath: rp }, args, rp);
+    }
+
+    if (p === "/api/merge/abort" && req.method === "POST") {
+      const { path: rp } = await readBody(req);
+      if (!rp) return sendJson(res, 400, { error: "path required" });
+      await collect("branchMergeAbort", { repositoryPath: rp }, {});
+      notifyChanged(rp, "mergAbort");
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (p === "/api/merge/resolve" && req.method === "POST") {
+      const { path: rp, mode, paths } = await readBody(req);
+      if (!rp || !mode || !Array.isArray(paths)) {
+        return sendJson(res, 400, { error: "path, mode, and paths array required" });
+      }
+      const absPathsArr = absFiles(rp, paths);
+      const modeMap = {
+        mine: "branchMergeResolveMine",
+        theirs: "branchMergeResolveTheirs",
+        manual: "branchMergeResolve",
+        unresolve: "branchMergeUnresolve",
+        restart: "branchMergeRestart",
+      };
+      const verb = modeMap[mode];
+      if (!verb) return sendJson(res, 400, { error: `unknown resolve mode: ${mode}` });
+      await collect(verb, { repositoryPath: rp }, { paths: absPathsArr });
+      notifyChanged(rp, "mergeResolve");
+      return sendJson(res, 200, { ok: true });
+    }
+
     if (p === "/api/diff" && req.method === "GET") {
       const file = q.get("file");
       // The native lib resolves relative path args against process.cwd(); anchor

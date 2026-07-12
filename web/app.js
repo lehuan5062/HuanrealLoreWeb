@@ -1059,7 +1059,7 @@ function scheduleRefresh({ repos = false, active = false } = {}) {
       refreshInflight = true;
       try {
         if (wantRepos) await loadRepos();
-        if (wantActive && state.active && !refreshInflight) await refreshActive();
+        if (wantActive && state.active) await refreshActive();
       } finally {
         refreshInflight = false;
       }

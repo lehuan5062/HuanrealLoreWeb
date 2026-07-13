@@ -751,9 +751,10 @@ const server = createServer(async (req, res) => {
     if (p === "/api/graph" && req.method === "GET") {
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
       const length = Number(q.get("length") ?? 100);
-      const key = cache.repoKey(repoPath, `graph:${length}`);
+      const archived = q.get("archived") === "true";
+      const key = cache.repoKey(repoPath, `graph:${length}:${archived ? "all" : "active"}`);
       const graph = await cache.cached(key, cache.TTL.repo, async () => {
-        const branchEvents = await collect("branchList", globalArgs, {});
+        const branchEvents = await collect("branchList", globalArgs, { archived });
         const branches = xform.branches(branchEvents);
         const histories = {};
         // Fetch per-branch history in parallel, degrading gracefully
@@ -806,8 +807,20 @@ const server = createServer(async (req, res) => {
 
     // Merge operations
     if (p === "/api/merge/start" && req.method === "POST") {
-      const { path: rp, branch, message, noCommit } = await readBody(req);
+      const { path: rp, branch, message, noCommit, expectedTarget } = await readBody(req);
       if (!rp || !branch) return sendJson(res, 400, { error: "path and branch required" });
+      // Guard against merging into a branch the client didn't intend: the UI
+      // can hold stale state right after a switch, so it declares which branch
+      // it believes is current and the merge is refused on any mismatch.
+      if (expectedTarget) {
+        const statusEvents = await collect("repositoryStatus", { repositoryPath: rp }, { staged: false });
+        const current = xform.repoSummary(statusEvents).branch;
+        if (current && current !== expectedTarget) {
+          return sendJson(res, 409, {
+            error: `current branch is ${current}, expected ${expectedTarget} — refresh and retry`,
+          });
+        }
+      }
       const args = { branch, noCommit: !!noCommit };
       if (message) args.message = message;
       return await streamOp(res, "branchMergeStart", { repositoryPath: rp }, args, rp);

@@ -18,6 +18,11 @@ const state = {
   discoveredServers: [],
   branches: [],
   graphSig: null,
+  // Refresh generation counter. Bumped by every refreshActive(); loaders capture
+  // it and discard responses from an older generation so an in-flight fetch that
+  // started before a mutation (e.g. a branch switch) can never overwrite the
+  // post-mutation state with pre-mutation data.
+  refreshSeq: 0,
 };
 
 async function apiGet(path) {
@@ -197,6 +202,13 @@ function showEmpty() {
   $("#repo-view").hidden = true;
 }
 
+/** Activate a tab (changes/history/branches) by name, syncing buttons and panels. */
+function switchTab(name) {
+  state.tab = name;
+  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
+  $$(".panel").forEach((pnl) => pnl.classList.toggle("active", pnl.dataset.panel === name));
+}
+
 /** Clear the active repo view and show a loading skeleton to prevent stale content flash on repo switch. */
 function clearRepoView() {
   $("#staged-files").innerHTML = '<li class="skeleton"></li><li class="skeleton"></li><li class="skeleton"></li>';
@@ -252,6 +264,7 @@ async function loadOrg(path) {
 /** Refetch every view for the active repo. The single source of freshness. */
 async function refreshActive() {
   if (!state.active) return;
+  state.refreshSeq++;
   const path = encodeURIComponent(state.active);
   const statusPromise = loadStatus(path);
   const historyPromise = loadHistory(path);
@@ -276,9 +289,10 @@ function fileBadge(f) {
 /** Fetches repository status and renders the staged/unstaged file lists. Ignores stale responses when the active repo has changed. */
 async function loadStatus(pathEnc) {
   const forPath = state.active;
+  const seq = state.refreshSeq;
   try {
     const data = await apiGet(`/api/status?path=${pathEnc}`);
-    if (state.active !== forPath) return;
+    if (state.active !== forPath || state.refreshSeq !== seq) return;
     $("#repo-branch").textContent = data.branch || "";
 
     // Store status for use in graph rendering and popover
@@ -621,9 +635,10 @@ async function commit() {
 
 async function loadHistory(pathEnc) {
   const forPath = state.active;
+  const seq = state.refreshSeq;
   try {
     const { revisions } = await apiGet(`/api/history?path=${pathEnc}&length=50`);
-    if (state.active !== forPath) return;
+    if (state.active !== forPath || state.refreshSeq !== seq) return;
     state.revisions = revisions;
     // Skip the rebuild when nothing changed, so a background refresh (poll, focus,
     // file-watch) does not collapse a revision the user has expanded.
@@ -716,10 +731,11 @@ async function showRevisionFileDiff(r, parent, file, detail) {
 
 async function loadBranches(pathEnc) {
   const forPath = state.active;
+  const seq = state.refreshSeq;
   try {
     const showArchived = $("#show-archived-check")?.checked ?? false;
-    const graphData = await apiGet(`/api/graph?path=${pathEnc}&length=100`);
-    if (state.active !== forPath) return;
+    const graphData = await apiGet(`/api/graph?path=${pathEnc}&length=100${showArchived ? "&archived=true" : ""}`);
+    if (state.active !== forPath || state.refreshSeq !== seq) return;
 
     // Dedupe branches by id, preferring LOCAL
     const deduped = graph.dedupeBranches(graphData.branches);
@@ -732,10 +748,13 @@ async function loadBranches(pathEnc) {
     // Store reachable revisions from current branch for sync enablement
     state.currentBranchRevisions = new Set((graphData.histories[currentBranch?.id] || []).map(r => r.revision));
 
-    // Populate merge source select
+    // Populate merge source select. Never rebuild while the merge dialog is
+    // open (a background refresh would silently reset the user's selection to
+    // the placeholder), and preserve the previous selection otherwise.
     const mergeSelect = $("#merge-source");
-    if (mergeSelect) {
-      const options = branches.filter((b) => !b.isCurrent);
+    if (mergeSelect && !$("#merge-dialog")?.open) {
+      const prev = mergeSelect.value;
+      const options = branches.filter((b) => !b.isCurrent && !b.archived);
       mergeSelect.innerHTML = '<option value="">— Select branch —</option>';
       for (const b of options) {
         const opt = document.createElement("option");
@@ -743,6 +762,7 @@ async function loadBranches(pathEnc) {
         opt.textContent = b.name;
         mergeSelect.appendChild(opt);
       }
+      if (prev && options.some((b) => b.id === prev)) mergeSelect.value = prev;
     }
 
     // Render sidebar
@@ -750,11 +770,13 @@ async function loadBranches(pathEnc) {
     ul.innerHTML = "";
     for (const b of branches) {
       const li = document.createElement("li");
-      li.className = b.isCurrent ? "current" : "";
+      li.className = (b.isCurrent ? "current" : "") + (b.archived ? " archived" : "");
+      const actionable = !b.isCurrent && !b.archived;
       li.innerHTML = `
         <div class="b-head">
           <span class="b-current-dot">${b.isCurrent ? "●" : "○"}</span>
           <span class="b-name" title="${b.name}">${b.name}</span>
+          ${b.archived ? `<span class="b-archived-badge">archived</span>` : ""}
         </div>
         <div class="b-cat">${b.category || "—"}</div>
         <div class="b-meta">
@@ -762,12 +784,12 @@ async function loadBranches(pathEnc) {
           <span>${(b.latest || "").slice(0, 12)}</span>
         </div>
         <div class="b-actions">
-          ${!b.isCurrent ? `<button class="b-switch" title="Switch to branch">Switch</button>` : ""}
-          ${!b.isCurrent ? `<button class="b-merge" title="Merge into current">Merge</button>` : ""}
-          ${!b.isCurrent ? `<button class="b-archive" title="Archive branch">Archive</button>` : ""}
+          ${actionable ? `<button class="b-switch" title="Switch to branch">Switch</button>` : ""}
+          ${actionable ? `<button class="b-merge" title="Merge into current">Merge</button>` : ""}
+          ${actionable ? `<button class="b-archive" title="Archive branch">Archive</button>` : ""}
         </div>`;
       ul.appendChild(li);
-      if (!b.isCurrent) {
+      if (actionable) {
         li.querySelector(".b-switch")?.addEventListener("click", () => switchBranch(b));
         li.querySelector(".b-merge")?.addEventListener("click", () => startMerge(b));
         li.querySelector(".b-archive")?.addEventListener("click", () => archiveBranch(b));
@@ -800,17 +822,23 @@ async function createBranch() {
     toast("Branch name required", true);
     return;
   }
+  const goBtn = $("#create-branch-go");
+  if (goBtn) goBtn.disabled = true;
   try {
     await apiPost("/api/branch/create", {
       path: state.active,
       branch: name,
       category,
     });
+    // Block until every view reflects the new branch, so the user cannot act
+    // on stale state (e.g. merge with the old current branch still shown).
+    await refreshActive();
     toast(`Created branch ${name}`);
-    await loadBranches(encodeURIComponent(state.active));
     $("#create-branch-dialog")?.close?.();
   } catch (err) {
     toast(err.message, true);
+  } finally {
+    if (goBtn) goBtn.disabled = false;
   }
 }
 
@@ -834,14 +862,19 @@ async function archiveBranch(branch) {
       path: state.active,
       branch: branch.name,
     });
+    await refreshActive();
     toast(`Archived ${branch.name}`);
-    await loadBranches(encodeURIComponent(state.active));
   } catch (err) {
     toast(err.message, true);
   }
 }
 
 async function startMerge(branch) {
+  const target = state.status?.branch || "current branch";
+  const targetEl = $("#merge-target");
+  if (targetEl) targetEl.innerHTML = `Merging into <strong>${target}</strong>`;
+  const msgEl = $("#merge-message");
+  if (msgEl && branch) msgEl.placeholder = `Merge ${branch.name} into ${target}`;
   $("#merge-source").value = branch.id;
   $("#merge-dialog")?.showModal?.();
 }
@@ -853,15 +886,29 @@ async function confirmMerge() {
     toast("Select a source branch", true);
     return;
   }
-  const message = $("#merge-message")?.value?.trim() || "";
+  const target = state.status?.branch || "current branch";
   const noCommit = $("#merge-no-commit-check")?.checked ?? false;
+  // An empty message would leave the merge staged but uncommitted (the lib only
+  // auto-commits when a message is given) — invisible in history and easy to
+  // mistake for a no-op. Default a message unless no-commit was chosen.
+  let message = $("#merge-message")?.value?.trim() || "";
+  if (!message && !noCommit) message = `Merge ${sourceBranch.name} into ${target}`;
   $("#merge-dialog").close();
   await runOp(`Merge ${sourceBranch.name}`, "/api/merge/start", {
     path: state.active,
     branch: sourceBranch.name,
     message,
     noCommit,
+    // The server refuses the merge if the actual current branch differs — the
+    // last line of defense against merging with a stale idea of the target.
+    expectedTarget: state.status?.branch || "",
   });
+  // A staged-but-uncommitted merge (no-commit requested, or conflicts) needs
+  // the user to finish it in the Changes tab — take them there.
+  if (state.status?.inMerge || (noCommit && state.status?.files?.some((f) => f.flagStaged))) {
+    switchTab("changes");
+    toast("Merge staged — review and commit in Changes");
+  }
 }
 
 /** Format a byte count as a short human-readable string, for example "42.1 MB".
@@ -946,8 +993,14 @@ async function runOp(title, path, payload) {
     statusEl.textContent = `Failed: ${err.message}`;
     statusEl.className = "fail";
   }
-  closeBtn.hidden = false;
+  // Keep the overlay blocking until every view reflects the new repo state —
+  // interacting with stale branch/status data right after a switch or merge is
+  // how merges end up aimed at the wrong branch.
+  const doneText = statusEl.textContent;
+  statusEl.textContent = `${doneText} — refreshing…`;
   await refreshActive();
+  statusEl.textContent = doneText;
+  closeBtn.hidden = false;
 }
 
 async function syncToRevision(revision) {
@@ -1416,11 +1469,7 @@ function wire() {
   wireInit();
 
   $$(".tab").forEach((tab) => {
-    tab.onclick = () => {
-      state.tab = tab.dataset.tab;
-      $$(".tab").forEach((t) => t.classList.toggle("active", t === tab));
-      $$(".panel").forEach((pnl) => pnl.classList.toggle("active", pnl.dataset.panel === state.tab));
-    };
+    tab.onclick = () => switchTab(tab.dataset.tab);
   });
 
   // Freshness: refetch when the window regains focus (coalesced).

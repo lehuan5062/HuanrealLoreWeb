@@ -204,6 +204,23 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .graph-node:hover { opacity: 1; filter: drop-shadow(0 0 3px rgba(110, 168, 254, 0.6)); }
 .graph-label { pointer-events: none; font-weight: 500; }
 
+/* Archived branches: muted dots/labels in the graph, badge in the sidebar */
+.graph-node.g-archived { opacity: 0.35; }
+.graph-label.g-archived { opacity: 0.45; font-style: italic; }
+.branches li.archived { opacity: 0.6; }
+.b-archived-badge {
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1px 6px;
+  margin-left: auto;
+}
+
+/* Merge dialog target line */
+.merge-target { color: var(--muted); font-size: 12px; margin: -4px 0 4px; }
+.merge-target strong { color: var(--text); }
+
 /* Operation overlay */
 .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: grid; place-items: center; z-index: 50; }
 .op-modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; width: min(720px, 92vw); max-height: 80vh; display: flex; flex-direction: column; }

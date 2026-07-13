@@ -72,6 +72,7 @@ export function layoutGraph(graph, currentBranchId) {
         lane: laneIdx,
         branch: branch.name,
         branchId: branch.id,
+        archived: !!branch.archived,
         timestamp: rev.timestamp || 0,
         message: rev.message || "",
         parent: rev.parent || [],
@@ -256,7 +257,10 @@ export function renderGraph(svgEl, layout, opts = {}) {
       cy: y,
       r: NODE_RADIUS,
       fill: `var(--lane-${node.lane % 8})`,
-      class: "graph-node" + (currentRevision === node.revision ? " current-rev" : ""),
+      class:
+        "graph-node" +
+        (currentRevision === node.revision ? " current-rev" : "") +
+        (node.archived ? " g-archived" : ""),
       style: "cursor: pointer",
     });
 
@@ -285,9 +289,9 @@ export function renderGraph(svgEl, layout, opts = {}) {
         y: y + 4,
         "font-size": "11",
         fill: "var(--text)",
-        class: "graph-label",
+        class: "graph-label" + (node.archived ? " g-archived" : ""),
       });
-      label.textContent = node.branch;
+      label.textContent = node.branch + (node.archived ? " (archived)" : "");
       svgEl.appendChild(label);
     }
   }

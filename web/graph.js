@@ -260,12 +260,8 @@ export function renderGraph(svgEl, layout, opts = {}) {
       style: "cursor: pointer",
     });
 
-    if (onNodeClick) {
-      dot.addEventListener("click", (evt) => {
-        if (!dragState.dragged) onNodeClick(node, evt);
-        dragState.dragged = false;
-      });
-    }
+    // Stamp node data on element for click detection via SVG pointer handlers
+    dot._node = node;
 
     // Hover tooltip
     const title = el("title");
@@ -296,13 +292,14 @@ export function renderGraph(svgEl, layout, opts = {}) {
     }
   }
 
+  // Store callback and drag state for pointer handlers
+  svgEl._onNodeClick = onNodeClick;
+  svgEl._dragState = dragState;
+
   // Zoom/pan interactions (only attach once per SVG element)
   if (!svgEl._zoomAttached) {
     svgEl._zoomAttached = true;
-    svgEl._dragState = dragState;
     attachGraphInteractions(svgEl);
-  } else {
-    svgEl._dragState = dragState;
   }
 
   // CSS for lane colors (defined inline in style.css)
@@ -347,10 +344,11 @@ function attachGraphInteractions(svgEl) {
     svgEl.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
   });
 
-  // Drag to pan
-  let lastX = 0, lastY = 0;
+  // Drag to pan; track original target before pointer capture retargets
+  let lastX = 0, lastY = 0, downTarget = null;
   svgEl.addEventListener("pointerdown", (evt) => {
     evt.preventDefault(); // stop text-selection/native drag from eating the gesture
+    downTarget = evt.target; // capture original target before setPointerCapture
     svgEl.setPointerCapture(evt.pointerId);
     lastX = evt.clientX;
     lastY = evt.clientY;
@@ -389,10 +387,24 @@ function attachGraphInteractions(svgEl) {
   });
 
   svgEl.addEventListener("pointerup", (evt) => {
+    const dragState = svgEl._dragState;
+    // Click detection: if not dragged and target is a node, call callback
+    if (!dragState?.dragged && downTarget?._node) {
+      const callback = svgEl._onNodeClick;
+      if (callback) {
+        callback(downTarget._node, {
+          clientX: evt.clientX,
+          clientY: evt.clientY,
+          target: downTarget,
+        });
+      }
+    }
+    downTarget = null;
     svgEl.style.cursor = "grab";
   });
 
   svgEl.addEventListener("pointercancel", () => {
+    downTarget = null;
     svgEl.style.cursor = "grab";
   });
 }

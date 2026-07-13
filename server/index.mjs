@@ -384,17 +384,27 @@ async function recreateLore(path, repositoryUrl) {
   }
   log.info("recreating repository .lore", { path, repositoryUrl, id });
   const backup = `${dot}.repair-bak`;
-  rmSync(backup, { recursive: true, force: true });
-  renameSync(dot, backup);
+  // Suspend the watcher to avoid EPERM on Windows when renaming .lore (fs.watch
+  // holds an open directory handle that blocks renames). Re-establish it in
+  // finally so both success and rollback paths resume watching.
+  const wasWatched = unwatchRepo(path);
   try {
-    await collect("repositoryCreate", { repositoryPath: path, offline: true }, { repositoryUrl, id });
-  } catch (err) {
-    rmSync(dot, { recursive: true, force: true });
-    renameSync(backup, dot);
-    throw err;
+    rmSync(backup, { recursive: true, force: true });
+    renameSync(dot, backup);
+    try {
+      await collect("repositoryCreate", { repositoryPath: path, offline: true }, { repositoryUrl, id });
+    } catch (err) {
+      rmSync(dot, { recursive: true, force: true });
+      renameSync(backup, dot);
+      throw err;
+    }
+    rmSync(backup, { recursive: true, force: true });
+    setupLoreignore(path);
+  } finally {
+    if (wasWatched) {
+      watchRepo(path, () => notifyChanged(path, "fs"));
+    }
   }
-  rmSync(backup, { recursive: true, force: true });
-  setupLoreignore(path);
   return id;
 }
 

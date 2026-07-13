@@ -47,10 +47,14 @@ export function watchRepo(repoPath, onChange) {
   log.debug("watching repo", { repoPath, watchers: entry.watchers.length });
 }
 
-/** Stop watching a repo. @param {string} repoPath */
+/**
+ * Stop watching a repo.
+ * @param {string} repoPath
+ * @returns {boolean} true if a watcher existed and was closed, false otherwise
+ */
 export function unwatchRepo(repoPath) {
   const entry = active.get(repoPath);
-  if (!entry) return;
+  if (!entry) return false;
   if (entry.timer) clearTimeout(entry.timer);
   for (const w of entry.watchers) {
     try {
@@ -60,4 +64,5 @@ export function unwatchRepo(repoPath) {
     }
   }
   active.delete(repoPath);
+  return true;
 }

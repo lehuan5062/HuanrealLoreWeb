@@ -253,7 +253,10 @@ async function loadOrg(path) {
 async function refreshActive() {
   if (!state.active) return;
   const path = encodeURIComponent(state.active);
-  await Promise.all([loadStatus(path), loadHistory(path), loadBranches(path)]);
+  const statusPromise = loadStatus(path);
+  const historyPromise = loadHistory(path);
+  const branchesPromise = statusPromise.then(() => loadBranches(path));
+  await Promise.all([statusPromise, historyPromise, branchesPromise]);
 }
 
 function fileBadge(f) {
@@ -366,14 +369,7 @@ async function resolveConflict(path, mode) {
 async function completeMerge() {
   const ok = confirm("Complete merge? This will commit all staged changes.");
   if (!ok) return;
-  const msg = "Merge completed";
-  try {
-    await apiPost("/api/commit", { path: state.active, message: msg });
-    toast("Merge completed");
-    await loadStatus(encodeURIComponent(state.active));
-  } catch (err) {
-    toast(err.message, true);
-  }
+  await runOp("Completing merge…", "/api/commit", { path: state.active, message: "Merge completed" });
 }
 
 async function abortMerge() {
@@ -733,6 +729,9 @@ async function loadBranches(pathEnc) {
     const branches = deduped.filter((b) => showArchived || !b.archived);
     const currentBranch = branches.find((b) => b.isCurrent);
 
+    // Store reachable revisions from current branch for sync enablement
+    state.currentBranchRevisions = new Set((graphData.histories[currentBranch?.id] || []).map(r => r.revision));
+
     // Populate merge source select
     const mergeSelect = $("#merge-source");
     if (mergeSelect) {
@@ -779,8 +778,10 @@ async function loadBranches(pathEnc) {
     if (graphData.branches.length > 0) {
       const layout = graph.layoutGraph(graphData, currentBranch?.id);
       const sig = graph.layoutSignature(layout);
-      if (state.graphSig !== sig) {
-        state.graphSig = sig;
+      // Include current revision in signature so revision-changed-but-topology-unchanged still triggers re-render
+      const compositeSig = sig + "|" + (state.status?.revision || "");
+      if (state.graphSig !== compositeSig) {
+        state.graphSig = compositeSig;
         graph.renderGraph($("#branch-graph"), layout, {
           onNodeClick: (node, evt) => showNodePopover(node, evt),
           currentRevision: state.status?.revision,
@@ -964,12 +965,13 @@ async function syncToRevision(revision) {
 function showNodePopover(node, evt) {
   const popover = $("#node-popover");
   const currentBranch = state.branches?.find((b) => b.isCurrent);
-  const isDifferentBranch = node.branchId !== currentBranch?.id;
   const shortHash = (node.revision || "").slice(0, 12);
   const when = node.timestamp ? new Date(node.timestamp).toLocaleString() : "";
 
+  // Sync is enabled for revisions reachable from the current branch
+  const syncable = state.currentBranchRevisions?.has(node.revision);
   let syncButton = "";
-  if (isDifferentBranch) {
+  if (!syncable) {
     syncButton = `<button class="pop-action" disabled title="Switch to ${node.branch} first">Sync to this revision</button>`;
   } else {
     syncButton = `<button class="pop-action pop-sync">Sync to this revision</button>`;

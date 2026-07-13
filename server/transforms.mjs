@@ -63,9 +63,13 @@ export function status(events) {
   }
   // Count unresolved conflicts
   const conflicts = files.filter((f) => f.flagConflictUnresolved).length;
-  // inMerge: non-zero hash (SHA-256 is 64 hex chars, all zeros = no merge)
+  // inMerge: a staged merge anchor exists (revisionStaged non-zero and different from HEAD)
+  // AND a merge is being merged (revisionMerged non-zero). Prevents false positives when
+  // HEAD itself is a merge commit: revisionMerged will be non-zero but no staged anchor means
+  // the merge is already committed (not in progress).
   const isZeroHash = (h) => !h || /^0+$/.test(h);
-  const inMerge = !isZeroHash(revisionMerged);
+  const hasStagedState = !isZeroHash(revisionStaged) && revisionStaged !== revision;
+  const inMerge = hasStagedState && !isZeroHash(revisionMerged);
   return { branch, revision, revisionMerged, revisionStaged, files, summary, inMerge, conflicts };
 }
 

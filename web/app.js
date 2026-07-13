@@ -317,6 +317,8 @@ async function loadStatus(pathEnc) {
 function renderMergeUI(statusData) {
   const banner = $("#merge-banner");
   const conflictsSection = $("#conflicts-section");
+  const completeBtn = $("#merge-complete-btn");
+  const abortBtn = $("#merge-abort-btn");
 
   if (!statusData.inMerge) {
     banner.hidden = true;
@@ -326,8 +328,9 @@ function renderMergeUI(statusData) {
 
   banner.hidden = false;
 
-  // Get conflicts from files
+  // Get conflicts and staged files from files
   const conflicts = statusData.files.filter((f) => f.flagConflictUnresolved);
+  const stagedFiles = statusData.files.filter((f) => f.flagStaged);
 
   if (conflicts.length > 0) {
     conflictsSection.hidden = false;
@@ -337,9 +340,28 @@ function renderMergeUI(statusData) {
     conflictsSection.hidden = true;
   }
 
-  // Update merge status text
   const branch = statusData.branch || "unknown";
-  $("#merge-status-text").textContent = `Merging into ${branch}${conflicts.length > 0 ? ` — ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}` : " — all resolved"}`;
+  const isEmpty = conflicts.length === 0 && stagedFiles.length === 0;
+
+  if (isEmpty) {
+    // Empty merge: nothing to commit
+    $("#merge-status-text").textContent = `Nothing to merge — already up to date`;
+    completeBtn.hidden = true;
+    abortBtn.textContent = "Clear merge state";
+    abortBtn.hidden = false;
+  } else if (conflicts.length > 0) {
+    // Has conflicts
+    $("#merge-status-text").textContent = `Merging into ${branch} — ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}`;
+    completeBtn.hidden = false;
+    abortBtn.textContent = "Abort";
+    abortBtn.hidden = false;
+  } else {
+    // Has staged changes, no conflicts
+    $("#merge-status-text").textContent = `Merging into ${branch} — all resolved`;
+    completeBtn.hidden = false;
+    abortBtn.textContent = "Abort";
+    abortBtn.hidden = false;
+  }
 }
 
 function renderConflicts(conflicts) {
@@ -381,12 +403,34 @@ async function resolveConflict(path, mode) {
 }
 
 async function completeMerge() {
+  // Guard: no staged files means nothing to commit
+  const hasStagedFiles = (state.status?.files || []).some((f) => f.flagStaged);
+  if (!hasStagedFiles) {
+    toast("Nothing staged — clearing merge state instead");
+    await apiPost("/api/merge/abort", { path: state.active });
+    await refreshActive();
+    return;
+  }
+
   const ok = confirm("Complete merge? This will commit all staged changes.");
   if (!ok) return;
   await runOp("Completing merge…", "/api/commit", { path: state.active, message: "Merge completed" });
 }
 
 async function abortMerge() {
+  const hasStagedFiles = (state.status?.files || []).some((f) => f.flagStaged);
+  // Skip confirmation if nothing is staged — nothing to lose
+  if (!hasStagedFiles) {
+    try {
+      await apiPost("/api/merge/abort", { path: state.active });
+      toast("Merge state cleared");
+      await loadStatus(encodeURIComponent(state.active));
+    } catch (err) {
+      toast(err.message, true);
+    }
+    return;
+  }
+
   const ok = confirm("Abort merge? This will discard all staged changes.");
   if (!ok) return;
   try {
@@ -903,6 +947,21 @@ async function confirmMerge() {
     // last line of defense against merging with a stale idea of the target.
     expectedTarget: state.status?.branch || "",
   });
+
+  // Auto-clear an empty merge (nothing staged, no conflicts)
+  const hasConflicts = (state.status?.files || []).some((f) => f.flagConflictUnresolved);
+  const hasStagedFiles = (state.status?.files || []).some((f) => f.flagStaged);
+  if (state.status?.inMerge && !hasConflicts && !hasStagedFiles) {
+    try {
+      await apiPost("/api/merge/abort", { path: state.active });
+      await refreshActive();
+      toast(`Nothing to merge — ${sourceBranch.name} is already merged into ${target}`);
+      return;
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
   // A staged-but-uncommitted merge (no-commit requested, or conflicts) needs
   // the user to finish it in the Changes tab — take them there.
   if (state.status?.inMerge || (noCommit && state.status?.files?.some((f) => f.flagStaged))) {

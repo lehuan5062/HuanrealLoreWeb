@@ -123,16 +123,57 @@ test("status includes merge-related fields", () => {
   assert.equal(s.revisionStaged, "stg789");
 });
 
-test("status detects inMerge when revisionMerged is non-zero hash", () => {
+test("status returns inMerge false when HEAD is a merge commit (revisionMerged non-zero but no staged anchor)", () => {
   const events = [
     ev("REPOSITORY_STATUS_REVISION", {
       branchName: "main",
       revision: "abc123",
       revisionMerged: "nonzerodef456",
+      revisionStaged: undefined, // No staged anchor
+    }),
+  ];
+  const s = xform.status(events);
+  assert.equal(s.inMerge, false);
+  assert.equal(s.revisionMerged, "nonzerodef456"); // Field still returned for debugging
+});
+
+test("status returns inMerge false when staged state equals current revision (no actual changes staged)", () => {
+  const events = [
+    ev("REPOSITORY_STATUS_REVISION", {
+      branchName: "main",
+      revision: "abc123",
+      revisionMerged: "nonzerodef456",
+      revisionStaged: "abc123", // Same as revision = no staged state
+    }),
+  ];
+  const s = xform.status(events);
+  assert.equal(s.inMerge, false);
+});
+
+test("status detects inMerge when staged anchor differs from revision and revisionMerged is non-zero", () => {
+  const events = [
+    ev("REPOSITORY_STATUS_REVISION", {
+      branchName: "main",
+      revision: "abc123",
+      revisionMerged: "nonzerodef456",
+      revisionStaged: "staged789", // Different from revision
     }),
   ];
   const s = xform.status(events);
   assert.equal(s.inMerge, true);
+});
+
+test("status returns inMerge false for plain staged changes (revisionStaged differs but no merge in progress)", () => {
+  const events = [
+    ev("REPOSITORY_STATUS_REVISION", {
+      branchName: "main",
+      revision: "abc123",
+      revisionMerged: "", // No merge
+      revisionStaged: "staged789", // Staged changes but no merge
+    }),
+  ];
+  const s = xform.status(events);
+  assert.equal(s.inMerge, false);
 });
 
 test("status treats empty string as not inMerge", () => {

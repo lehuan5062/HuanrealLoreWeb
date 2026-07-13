@@ -208,7 +208,8 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .graph-node.g-archived { opacity: 0.35; }
 .graph-label.g-archived { opacity: 0.45; font-style: italic; }
 .branches li.archived { opacity: 0.6; }
-.b-archived-badge {
+.b-archived-badge,
+.b-loc-badge {
   font-size: 10px;
   color: var(--muted);
   border: 1px solid var(--border);
@@ -216,6 +217,7 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
   padding: 1px 6px;
   margin-left: auto;
 }
+.b-loc-badge { cursor: help; }
 
 /* Merge dialog target line */
 .merge-target { color: var(--muted); font-size: 12px; margin: -4px 0 4px; }

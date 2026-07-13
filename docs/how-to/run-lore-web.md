@@ -52,6 +52,11 @@ collaborator who syncs with your server but runs no server of their own.
      revision in the graph or history list to sync the working copy to that point.
      Click a branch row's **Switch** to change branches or **Merge** to merge another
      branch in.
+   - Archiving a branch deletes it on the server too, but each collaborator's
+     working copy keeps its own cached entry — Lore never prunes those remotely.
+     A branch marked **local only** was either never pushed or was archived by a
+     teammate; if it's the latter, archive it on your side as well to tidy the
+     list (harmless — the server-side delete already happened).
 
 ## Change a repository's organization
 

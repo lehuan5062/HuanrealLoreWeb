@@ -783,6 +783,16 @@ async function loadBranches(pathEnc) {
 
     // Dedupe branches by id, preferring LOCAL
     const deduped = graph.dedupeBranches(graphData.branches);
+    // Presence per side, computed before dedupe collapses locations. A branch
+    // only in the local cache was either never pushed or archived on the server
+    // by a collaborator (archives delete server-side but never prune other
+    // clients' local caches) — surfaced as a badge so it can be tidied.
+    const localIds = new Set(graphData.branches.filter((b) => b.location === 0).map((b) => b.id));
+    const remoteIds = new Set(graphData.branches.filter((b) => b.location === 1).map((b) => b.id));
+    for (const b of deduped) {
+      b.localOnly = localIds.has(b.id) && !remoteIds.has(b.id);
+      b.remoteOnly = remoteIds.has(b.id) && !localIds.has(b.id);
+    }
     state.branches = deduped;
 
     // Filter branches (active or archived)
@@ -821,6 +831,8 @@ async function loadBranches(pathEnc) {
           <span class="b-current-dot">${b.isCurrent ? "●" : "○"}</span>
           <span class="b-name" title="${b.name}">${b.name}</span>
           ${b.archived ? `<span class="b-archived-badge">archived</span>` : ""}
+          ${!b.archived && b.localOnly ? `<span class="b-loc-badge" title="Not on the server — either never pushed, or archived/deleted by a collaborator. Archive to remove it here.">local only</span>` : ""}
+          ${!b.archived && b.remoteOnly ? `<span class="b-loc-badge" title="Exists on the server but not in this working copy.">remote only</span>` : ""}
         </div>
         <div class="b-cat">${b.category || "—"}</div>
         <div class="b-meta">

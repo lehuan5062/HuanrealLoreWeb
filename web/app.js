@@ -307,6 +307,9 @@ async function loadStatus(pathEnc) {
     renderFiles($("#unstaged-files"), unstaged, "stage");
     $("#commit-btn").disabled = staged.length === 0;
     $("#stage-all-btn").disabled = unstaged.length === 0;
+    $("#unstage-all-btn").disabled = staged.length === 0;
+    $("#revert-all-btn").disabled = unstaged.length === 0;
+    state.staged = staged;
     state.unstaged = unstaged;
     updateChangesBar(data);
   } catch (err) {
@@ -481,6 +484,33 @@ async function stageAll() {
   if (files.length === 0) return;
   try {
     await apiPost("/api/stage", { path: state.active, files });
+    await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/** Unstages every currently staged file in the active repository. */
+async function unstageAll() {
+  const files = (state.staged || []).map((f) => f.path);
+  if (files.length === 0) return;
+  try {
+    await apiPost("/api/unstage", { path: state.active, files });
+    await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/** Reverts every currently unstaged change in the active repository. */
+async function revertAll() {
+  const count = (state.unstaged || []).length;
+  if (count === 0) return;
+  const ok = confirm(`Discard all unstaged changes to ${count} file(s)? New files will be deleted. This cannot be undone.`);
+  if (!ok) return;
+  const files = (state.unstaged || []).map((f) => f.path);
+  try {
+    await apiPost("/api/reset", { path: state.active, files });
     await loadStatus(encodeURIComponent(state.active));
   } catch (err) {
     toast(err.message, true);
@@ -1406,6 +1436,8 @@ function wire() {
   $("#refresh-btn").onclick = refreshActive;
   $("#commit-btn").onclick = commit;
   $("#stage-all-btn").onclick = stageAll;
+  $("#unstage-all-btn").onclick = unstageAll;
+  $("#revert-all-btn").onclick = revertAll;
   $("#ignore-cancel").onclick = () => $("#ignore-dialog").close();
 
   $("#sync-btn").onclick = () => runOp("Syncing…", "/api/sync", { path: state.active });

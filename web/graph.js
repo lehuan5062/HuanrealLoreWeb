@@ -24,17 +24,31 @@ export function dedupeBranches(branches) {
  * Edges: linear (within branch), fork (to parent), merge (dashed).
  * @param {{ branches, histories }} graph from /api/graph
  * @param {string} currentBranchId the active branch's id
- * @returns {{ lanes: object[], nodes: object[], edges: object[] }}
+ * @returns {{ lanes: object[], nodes: object[], edges: object[], extraTips: object[] }}
  */
 export function layoutGraph(graph, currentBranchId) {
   const { branches: rawBranches, histories } = graph;
 
   // Dedupe branches by id, preferring LOCAL
   const branches = dedupeBranches(rawBranches);
+  const branchIdSet = new Set(branches.map((b) => b.id));
+
+  // Helper: find the effective parent of a branch by walking its stack
+  // to the nearest ancestor that exists in the deduped branch set.
+  function getEffectiveParentId(branch) {
+    if (!branch.stack || branch.stack.length === 0) return null;
+    for (const ancestor of branch.stack) {
+      if (branchIdSet.has(ancestor.branch)) {
+        return ancestor.branch;
+      }
+    }
+    return null; // entire stack absent
+  }
 
   // Assign lanes: lane 0 = default (empty stack), children by created time
   const lanes = [];
   const laneMap = new Map(); // branchId -> lane index
+  const placedBranches = new Set(); // track which branches have been placed
   const queue = branches.filter((b) => !b.stack || b.stack.length === 0);
   queue.sort((a, b) => (a.created || 0) - (b.created || 0));
 
@@ -42,26 +56,41 @@ export function layoutGraph(graph, currentBranchId) {
     const lane = lanes.length;
     lanes.push(b);
     laneMap.set(b.id, lane);
+    placedBranches.add(b.id);
 
-    // Find all children (branches whose stack points to this branch)
+    // Find all children (branches whose effective parent is this branch)
     const children = branches.filter(
       (ch) =>
-        ch.stack &&
-        ch.stack.length > 0 &&
-        ch.stack[0].branch === b.id
+        placedBranches.has(getEffectiveParentId(ch)) &&
+        getEffectiveParentId(ch) === b.id &&
+        !placedBranches.has(ch.id)
     );
     children.sort((a, b) => (a.created || 0) - (b.created || 0));
     queue.push(...children);
+  }
+
+  // Safety net: place any remaining unplaced branches as additional lanes
+  // (entire ancestry absent or filtered out)
+  const unplaced = branches.filter((b) => !placedBranches.has(b.id));
+  unplaced.sort((a, b) => (a.created || 0) - (b.created || 0));
+  for (const b of unplaced) {
+    const lane = lanes.length;
+    lanes.push(b);
+    laneMap.set(b.id, lane);
+    placedBranches.add(b.id);
   }
 
   // Collect all nodes: (lane, branch, revision)
   const nodes = [];
   const nodeMap = new Map(); // "revision" -> node
   const revisionToLane = new Map(); // revision -> lane index
+  const nodesPerLane = new Map(); // laneIdx -> count of nodes on this lane
 
   for (let laneIdx = 0; laneIdx < lanes.length; laneIdx++) {
     const branch = lanes[laneIdx];
     const history = histories[branch.id] || [];
+    let laneNodeCount = 0;
+
     for (const rev of history) {
       // Skip revisions already in nodeMap (shared with an earlier/parent lane)
       if (nodeMap.has(rev.revision)) continue;
@@ -80,7 +109,9 @@ export function layoutGraph(graph, currentBranchId) {
       nodes.push(node);
       nodeMap.set(rev.revision, node);
       revisionToLane.set(rev.revision, laneIdx);
+      laneNodeCount++;
     }
+    nodesPerLane.set(laneIdx, laneNodeCount);
   }
 
   // Sort nodes: timestamp desc, then per-branch revisionNumber desc
@@ -134,7 +165,37 @@ export function layoutGraph(graph, currentBranchId) {
     }
   }
 
-  return { lanes, nodes, edges, laneMap };
+  // Extra tips: branches with zero own nodes should still be visible via a label
+  // pointing at their latest revision (which exists on an ancestor's lane)
+  const extraTips = [];
+  for (let laneIdx = 0; laneIdx < lanes.length; laneIdx++) {
+    const branch = lanes[laneIdx];
+    const ownNodeCount = nodesPerLane.get(laneIdx) || 0;
+
+    // Only process branches with zero own nodes
+    if (ownNodeCount === 0) {
+      // Find the branch's latest revision from history
+      const history = histories[branch.id] || [];
+      if (history.length > 0) {
+        // Latest revision is the first one in the branch's history
+        const latestRev = history[0].revision;
+
+        // Check if this revision exists on another lane (parent or ancestor)
+        const revNode = nodeMap.get(latestRev);
+        if (revNode && revNode.lane !== laneIdx) {
+          extraTips.push({
+            revision: latestRev,
+            name: branch.name,
+            lane: revNode.lane, // the lane where the revision actually appears
+            branchName: branch.name,
+            archived: !!branch.archived,
+          });
+        }
+      }
+    }
+  }
+
+  return { lanes, nodes, edges, laneMap, extraTips };
 }
 
 /**
@@ -144,7 +205,7 @@ export function layoutGraph(graph, currentBranchId) {
  * @param {{ onNodeClick?: (node: object, evt: Event) => void, currentRevision?: string }} opts
  */
 export function renderGraph(svgEl, layout, opts = {}) {
-  const { lanes, nodes, edges } = layout;
+  const { lanes, nodes, edges, extraTips = [] } = layout;
   const { onNodeClick, currentRevision } = opts;
 
   // Clear existing content
@@ -293,6 +354,37 @@ export function renderGraph(svgEl, layout, opts = {}) {
       });
       label.textContent = node.branch + (node.archived ? " (archived)" : "");
       svgEl.appendChild(label);
+    }
+  }
+
+  // Render extra tips for branches with zero own nodes
+  for (const tip of extraTips) {
+    const tipNode = nodes.find((n) => n.revision === tip.revision);
+    if (tipNode) {
+      const x = PADDING + tipNode.lane * LANE_WIDTH + LANE_WIDTH / 2;
+      const y = PADDING + nodes.indexOf(tipNode) * ROW_HEIGHT + ROW_HEIGHT / 2;
+
+      // Append the branch name after the existing label with a separator
+      const existingLabel = Array.from(svgEl.querySelectorAll("text")).find(
+        (t) => Math.abs(parseFloat(t.getAttribute("x")) - (x + NODE_RADIUS + 6)) < 1 &&
+               Math.abs(parseFloat(t.getAttribute("y")) - (y + 4)) < 1
+      );
+
+      if (existingLabel) {
+        // Append to existing label text with a separator
+        existingLabel.textContent += " · " + tip.branchName + (tip.archived ? " (archived)" : "");
+      } else {
+        // Create a new label if none exists
+        const label = el("text", {
+          x: x + NODE_RADIUS + 6,
+          y: y + 4,
+          "font-size": "11",
+          fill: "var(--text)",
+          class: "graph-label" + (tip.archived ? " g-archived" : ""),
+        });
+        label.textContent = tip.branchName + (tip.archived ? " (archived)" : "");
+        svgEl.appendChild(label);
+      }
     }
   }
 

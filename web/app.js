@@ -826,6 +826,7 @@ async function loadBranches(pathEnc) {
       const li = document.createElement("li");
       li.className = (b.isCurrent ? "current" : "") + (b.archived ? " archived" : "");
       const actionable = !b.isCurrent && !b.archived;
+      const canArchive = actionable && (b.stack?.length > 0);
       li.innerHTML = `
         <div class="b-head">
           <span class="b-current-dot">${b.isCurrent ? "●" : "○"}</span>
@@ -842,7 +843,7 @@ async function loadBranches(pathEnc) {
         <div class="b-actions">
           ${actionable ? `<button class="b-switch" title="Switch to branch">Switch</button>` : ""}
           ${actionable ? `<button class="b-merge" title="Merge into current">Merge</button>` : ""}
-          ${actionable ? `<button class="b-archive" title="Archive branch">Archive</button>` : ""}
+          ${canArchive ? `<button class="b-archive" title="Archive branch">Archive</button>` : ""}
         </div>`;
       ul.appendChild(li);
       if (actionable) {

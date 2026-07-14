@@ -369,4 +369,137 @@ test("layoutGraph child branch with entirely shared history yields zero own node
   assert.equal(node.revision, "r1");
   assert.equal(node.lane, 0);
   assert.equal(node.branch, "main");
+  // Merged branch should have an extra tip pointing at r1
+  assert(layout.extraTips);
+  assert.equal(layout.extraTips.length, 1);
+  assert.equal(layout.extraTips[0].revision, "r1");
+  assert.equal(layout.extraTips[0].branchName, "merged");
+  assert.equal(layout.extraTips[0].lane, 0);
+});
+
+test("layoutGraph child of archived parent gets lane via nearest present ancestor", () => {
+  const graph = {
+    branches: [
+      {
+        id: "bid-1",
+        name: "main",
+        location: 0,
+        stack: [],
+        created: 100,
+      },
+      {
+        id: "bid-2",
+        name: "archived-parent",
+        location: 0,
+        stack: [{ branch: "bid-1", revision: "r1" }],
+        created: 200,
+        archived: true,
+      },
+      {
+        id: "bid-3",
+        name: "phuong",
+        location: 0,
+        stack: [
+          { branch: "bid-2", revision: "r2" },
+          { branch: "bid-1", revision: "r1" },
+        ],
+        created: 300,
+      },
+    ],
+    histories: {
+      "bid-1": [
+        {
+          revision: "r1",
+          revisionNumber: 1,
+          timestamp: 1000,
+          parent: [],
+        },
+      ],
+      "bid-2": [
+        {
+          revision: "r2",
+          revisionNumber: 1,
+          timestamp: 1500,
+          parent: ["r1"],
+        },
+      ],
+      "bid-3": [
+        {
+          revision: "r3",
+          revisionNumber: 1,
+          timestamp: 2000,
+          parent: ["r2"],
+        },
+        {
+          revision: "r4",
+          revisionNumber: 2,
+          timestamp: 2500,
+          parent: ["r3"],
+        },
+      ],
+    },
+  };
+
+  const layout = layoutGraph(graph, "bid-3");
+  // Three lanes: main, archived-parent, phuong
+  assert.equal(layout.lanes.length, 3);
+  // Phuong gets its own lane (index 2)
+  const phuongLane = layout.laneMap.get("bid-3");
+  assert.equal(phuongLane, 2);
+  // Phuong's nodes are on lane 2
+  const phuongNodes = layout.nodes.filter((n) => n.branchId === "bid-3");
+  assert(phuongNodes.length > 0);
+  phuongNodes.forEach((n) => assert.equal(n.lane, 2));
+});
+
+test("layoutGraph branch with entirely absent ancestry still gets a lane", () => {
+  const graph = {
+    branches: [
+      {
+        id: "bid-1",
+        name: "main",
+        location: 0,
+        stack: [],
+        created: 100,
+      },
+      {
+        id: "bid-2",
+        name: "orphan",
+        location: 0,
+        stack: [{ branch: "bid-99", revision: "unknown" }],
+        created: 200,
+      },
+    ],
+    histories: {
+      "bid-1": [
+        {
+          revision: "r1",
+          revisionNumber: 1,
+          timestamp: 1000,
+          parent: [],
+        },
+      ],
+      "bid-2": [
+        {
+          revision: "r2",
+          revisionNumber: 1,
+          timestamp: 2000,
+          parent: [],
+        },
+      ],
+    },
+  };
+
+  const layout = layoutGraph(graph, "bid-1");
+  // Both branches should have lanes
+  assert.equal(layout.lanes.length, 2);
+  assert(layout.laneMap.has("bid-1"));
+  assert(layout.laneMap.has("bid-2"));
+  // Orphan should be placed as a safety net
+  const orphanLane = layout.laneMap.get("bid-2");
+  assert(orphanLane !== undefined);
+  // Its node should exist
+  const orphanNodes = layout.nodes.filter((n) => n.branchId === "bid-2");
+  assert.equal(orphanNodes.length, 1);
+  assert.equal(orphanNodes[0].revision, "r2");
 });

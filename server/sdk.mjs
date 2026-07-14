@@ -96,7 +96,7 @@ export async function collect(verb, globalArgs, args = {}) {
         status = n.data?.status ?? 0;
         complete = n.data?.error ?? null;
       } else if (n.tag === "ERROR") {
-        errorEvent = n.data?.errorInner ?? errorEvent;
+        errorEvent = errorEvent ?? n.data?.errorInner;
       }
       events.push(n);
     }
@@ -107,7 +107,7 @@ export async function collect(verb, globalArgs, args = {}) {
     status = status || -1;
   }
   if (status !== 0) {
-    const message = complete?.message || errorEvent || `Lore verb '${verb}' failed`;
+    const message = errorEvent || complete?.message || `Lore verb '${verb}' failed`;
     log.debug("lore verb failed", { verb, status, message });
     throw new LoreVerbError(message, { verb, status, code: complete?.errorCode ?? status });
   }
@@ -135,9 +135,9 @@ export async function* stream(verb, globalArgs, args = {}) {
       const n = normalize(ev);
       if (n.tag === "COMPLETE") {
         status = n.data?.status ?? 0;
-        failure = n.data?.error?.message || failure;
+        failure = failure ?? n.data?.error?.message;
       }
-      if (n.tag === "ERROR") failure = n.data?.errorInner ?? failure;
+      if (n.tag === "ERROR") failure = failure ?? n.data?.errorInner;
       if (n.tag === "LOG") {
         const lvl = LOG_LEVEL[n.data?.level] ?? "debug";
         log[/** @type {"debug"} */ (lvl)](`lore: ${n.data?.message ?? ""}`, { verb });

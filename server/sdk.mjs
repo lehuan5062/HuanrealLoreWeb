@@ -101,8 +101,9 @@ export async function collect(verb, globalArgs, args = {}) {
       events.push(n);
     }
   } catch (err) {
-    // asyncIter throws LoreError on a non-zero return; the COMPLETE detail
-    // captured above is the canonical source, so mark failure and move on.
+    // asyncIter throws LoreError on a non-zero return; the detail captured
+    // above (first ERROR event, else COMPLETE) is the canonical source, so
+    // mark failure and move on.
     if (!(err instanceof LoreError)) throw err;
     status = status || -1;
   }
@@ -119,6 +120,8 @@ export async function collect(verb, globalArgs, args = {}) {
  * normalized events (including LOG, PROGRESS, and any ERROR detail) and a final
  * `{ tag: "DONE", data: { ok, status } }` marker. Never throws to the caller;
  * failures arrive as the terminal marker so the SSE channel can close cleanly.
+ * The DONE message prefers the first ERROR event's detail (the root cause —
+ * some verbs finish with a generic COMPLETE message after a specific ERROR).
  * @param {string} verb
  * @param {Record<string, unknown>} globalArgs
  * @param {Record<string, unknown>} [args]

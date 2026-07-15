@@ -16,7 +16,9 @@ the server was down.
 
 - Request and response bodies are JSON unless noted.
 - Errors return a non-2xx status with `{ "error": "<message>" }`, where the
-  message is the underlying Lore failure detail.
+  message is the underlying Lore failure detail. When a verb emits a specific
+  ERROR event and then finishes with a generic COMPLETE message, the reported
+  message is the first ERROR — the root cause, not the trailing summary.
 - `path` is an absolute path to a Lore working copy. Pass it as a query
   parameter on GETs and in the body on POSTs.
 
@@ -42,7 +44,7 @@ the server was down.
 
 | Method | Path | Query | Description |
 | --- | --- | --- | --- |
-| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `inMerge` (true when actively merging), `conflicts` (count of unresolved files), `revisionMerged` (merge parent hash), and `revisionStaged`. The status also includes `hasLoreignore`, `hasGitignore`, and `hasP4ignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. The full working-tree scan (which discovers untracked files, and can take seconds on a large working copy) does not block the response: the first read after a repo switch returns with `scanning: true` and only staged/tracked changes, then the scan completes in the background and an `/events` refresh tells the SPA to refetch the complete list. |
+| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `inMerge` (true only while a merge is actually in progress: a staged anchor exists — `revisionStaged` non-zero and different from `revision` — and `revisionMerged` is non-zero), `conflicts` (count of unresolved files), `revisionMerged` (merge parent hash; note this stays non-zero after a merge is committed, since HEAD's second parent is reported here — do not use it alone to detect a pending merge), and `revisionStaged`. The status also includes `hasLoreignore`, `hasGitignore`, and `hasP4ignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. The full working-tree scan (which discovers untracked files, and can take seconds on a large working copy) does not block the response: the first read after a repo switch returns with `scanning: true` and only staged/tracked changes, then the scan completes in the background and an `/events` refresh tells the SPA to refetch the complete list. |
 | GET | `/api/history` | `path`, `length` | Revision history (default 50), with message and timestamp. |
 | GET | `/api/branches` | `path`, `archived?` | Branch list. Each branch has `id`, `name`, `location` (`LOCAL`/`REMOTE`), `category`, `latest` (tip revision), `stack` (fork point parents), `creator`, `created`, `isCurrent`, and `archived`. Pass `archived=true` to include archived branches. |
 | GET | `/api/graph` | `path`, `length?`, `archived?` | Branch graph for visualization: `{ branches, histories }`. `histories` is a map of `branchId` to per-branch revision arrays (default length 100 per branch). Branches deduplicated by id, preferring `LOCAL`. Pass `archived=true` to include archived branches. Gracefully degrades: a failing per-branch history becomes an empty array, not a graph error. |
@@ -64,7 +66,7 @@ the server was down.
 | POST | `/api/repair` | `{ path }` | Rebuild the working copy's `.lore` in place to purge unremovable stale index entries, preserving the repository id and remote. Refused (409) when there is committed history. Returns `{ ok, id }`. |
 | POST | `/api/org` | `{ path, organization }` | Change a repo's organization. A repo's org is the `org/` prefix of its `name`, which Lore makes read-only after creation, so this rebuilds the working copy's `.lore` under a new URL (preserving the repository id and remote), which discards local committed revisions. The caller must confirm that loss first. `organization` cannot be empty or contain a slash. Returns `{ organization, repoName, name, id }`. |
 | POST | `/api/branch/create` | `{ path, branch, category? }` | Create a new branch. Returns `{ branch }` with the full branch object. |
-| POST | `/api/branch/archive` | `{ path, branch }` | Archive a branch. Returns `{ ok: true }`. Refused (409) if archiving the current branch. |
+| POST | `/api/branch/archive` | `{ path, branch }` | Archive a branch — Lore's form of delete: removed locally and on the server, but always recoverable (list with `archived=true`). Lore refuses to archive the current branch, the default branch (e.g. `main`), or a protected branch; the refusal reason is passed through as the error message. Returns `{ ok: true }`. |
 | POST | `/api/merge/abort` | `{ path }` | Abort an in-progress merge. Returns `{ ok: true }`. |
 | POST | `/api/merge/resolve` | `{ path, mode, paths }` | Resolve conflicts for files in a merge. `mode` is one of: `mine` (keep local), `theirs` (accept remote), `manual` (mark as manually resolved), `unresolve` (mark as unresolved), `restart` (redo merge). `paths` is relative to the working root. Returns `{ ok: true }`. |
 
@@ -72,6 +74,8 @@ the server was down.
 
 These respond with `application/x-ndjson`: one normalized Lore event per line,
 ending with a `{ "tag": "DONE", "data": { "ok", "status", "message" } }` marker.
+On failure the marker's `message` prefers the first ERROR event's detail (the
+root cause) over a later generic COMPLETE message.
 Long-running verbs also emit `*_BEGIN`/`*_PROGRESS`/`*_END` events carrying
 file and byte counts, which the web UI renders as a progress bar.
 

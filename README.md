@@ -17,10 +17,20 @@ It runs identically on two kinds of machine:
 
 - **Live refresh** — repository and revision lists update instantly on disk changes
   or after any action, with no manual cache clear.
-- **Visual branch graph** — see all branches and commits as an interactive graph;
-  click any revision to sync the working copy to it.
+- **Visual branch graph** — all branches and commits as an interactive graph with
+  wheel zoom, drag pan, and fit controls; click any revision to see its details or
+  sync the working copy to it. Every branch stays visible: children of archived
+  branches attach to the nearest visible ancestor, and branches with no commits of
+  their own are labeled at the revision they point to.
 - **Branch management** — create, switch, archive, and merge branches directly
-  from the web UI, with conflict resolution for merge conflicts.
+  from the web UI, with per-file conflict resolution for merges. Branches archived
+  by a teammate are flagged **local only** so each collaborator can tidy their own
+  list, and branches that exist on the server but not yet in your working copy are
+  flagged **remote only**.
+- **Safe by default** — merges state their target branch and are refused server-side
+  if the working copy's current branch changed underneath. The Changes panel can
+  unstage every staged file at once, or revert every unstaged change in bulk
+  (discarding edits and deleting new files, after a confirmation).
 
 ## Why this exists
 

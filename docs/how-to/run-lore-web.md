@@ -54,9 +54,26 @@ collaborator who syncs with your server but runs no server of their own.
      branch in.
    - Archiving a branch deletes it on the server too, but each collaborator's
      working copy keeps its own cached entry — Lore never prunes those remotely.
+     Archiving never hides a branch's descendants: in the graph, a child of an
+     archived branch attaches to its nearest visible ancestor instead. A branch
+     whose commits are all shared with its parent (e.g. freshly created or fully
+     merged) has no dots of its own; its name is shown next to the revision it
+     points at on the parent's lane.
      A branch marked **local only** was either never pushed or was archived by a
      teammate; if it's the latter, archive it on your side as well to tidy the
-     list (harmless — the server-side delete already happened).
+     list (harmless — the server-side delete already happened). A branch marked
+     **remote only** exists on the server but not yet in your working copy — for
+     example one a teammate created; Sync or Switch to it to pull it down locally.
+     The default branch (usually `main`), and any other root branch with no fork
+     point, can never be archived, so it has no Archive button — Lore fixes the
+     default at repository creation.
+   - The **Changes** panel can act on all files at once: **Unstage all** moves
+     every staged file back to unstaged, and **Revert all** discards every
+     unstaged change (editing back to the last revision and deleting new files)
+     after a confirmation prompt.
+   - When you start a merge that has nothing to apply, the dialog reports
+     **Nothing to merge — already up to date**; if a merge was left half-finished,
+     use **Clear merge state** to reset it.
 
 ## Change a repository's organization
 

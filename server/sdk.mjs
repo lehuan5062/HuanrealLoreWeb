@@ -74,8 +74,19 @@ function messageFromErrors(errors, fallback) {
 }
 
 /**
+ * Ceiling on a single `collect()` call, so a native verb that blocks (e.g. on a
+ * remote connect the SDK never bounds) can't hang an HTTP response forever.
+ * This is a backstop, not the fix: callers on the latency-sensitive read path
+ * should pass `offline: true` in globalArgs so the SDK never attempts the
+ * remote connect in the first place. The blocked native call keeps running
+ * after this fires (it can't be cancelled), but the request it was serving is
+ * freed to fail fast.
+ */
+const VERB_TIMEOUT_MS = Number(process.env.LORE_WEB_VERB_TIMEOUT_MS ?? 10_000);
+
+/**
  * Run a Lore verb to completion and return all of its events. Throws a
- * LoreVerbError if the operation fails.
+ * LoreVerbError if the operation fails or times out.
  * @param {string} verb such as "revisionHistory"
  * @param {Record<string, unknown>} globalArgs at minimum `{ repositoryPath }`
  * @param {Record<string, unknown>} [args] verb-specific arguments
@@ -89,8 +100,13 @@ export async function collect(verb, globalArgs, args = {}) {
   let complete = null;
   /** @type {string|null} */
   let errorEvent = null;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+  }, VERB_TIMEOUT_MS);
   try {
     for await (const ev of fn(globalArgs, args).asyncIter()) {
+      if (timedOut) break;
       const n = normalize(ev);
       if (n.tag === "COMPLETE") {
         status = n.data?.status ?? 0;
@@ -106,6 +122,12 @@ export async function collect(verb, globalArgs, args = {}) {
     // mark failure and move on.
     if (!(err instanceof LoreError)) throw err;
     status = status || -1;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (timedOut) {
+    log.debug("lore verb timed out", { verb, timeoutMs: VERB_TIMEOUT_MS });
+    throw new LoreVerbError(`Lore verb '${verb}' timed out after ${VERB_TIMEOUT_MS}ms`, { verb, status: -1, code: -1 });
   }
   if (status !== 0) {
     const message = errorEvent || complete?.message || `Lore verb '${verb}' failed`;

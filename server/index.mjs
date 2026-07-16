@@ -32,6 +32,18 @@ function isRepo(path) {
 }
 
 /**
+ * Global args for a render-path read: `offline: true` skips Lore's default
+ * remote-first resolution (status/history otherwise await a remote connect
+ * before falling back to local, which can stall for seconds against a down
+ * server). Never use this for verbs that must reach the server (sync, push,
+ * clone, branch switch, remote listing) — those need the real connection.
+ * @param {string} repoPath
+ */
+function readArgs(repoPath) {
+  return { repositoryPath: repoPath, offline: true };
+}
+
+/**
  * The remote server base to assign when initializing a brand-new repository, so
  * the user never types one. Reads from configured default remote, falls back to
  * an already-tracked repo's remote, or the default local Lore server. The repo
@@ -195,7 +207,7 @@ async function enrichRepo(r) {
   if (!exists) return { ...r, exists, organization: "" };
 
   const [info, organization] = await Promise.all([
-    collect("repositoryStatus", { repositoryPath: r.path }, { staged: false })
+    collect("repositoryStatus", readArgs(r.path), { staged: false })
       .then((events) => xform.repoSummary(events))
       .catch((err) => {
         log.debug("repo enrich failed", { path: r.path, message: err instanceof Error ? err.message : String(err) });
@@ -585,12 +597,11 @@ async function browse(res, rawPath) {
  * large working copies; `scan: true` is the complete picture but can take
  * seconds on a repo with many files.
  * @param {string} repoPath repository path
- * @param {Record<string, unknown>} globalArgs SDK global args (repositoryPath)
  * @param {boolean} scan whether to run the full working-tree scan
  * @returns {Promise<object>} status data with hasLoreignore/hasGitignore/hasP4ignore and nested flags applied
  */
-async function fetchStatus(repoPath, globalArgs, scan) {
-  const events = await collect("repositoryStatus", globalArgs, { staged: true, scan });
+async function fetchStatus(repoPath, scan) {
+  const events = await collect("repositoryStatus", readArgs(repoPath), { staged: true, scan });
   const data = xform.status(events);
   // The UI offers an "Initialize .loreignore" action when one is absent.
   data.hasLoreignore = hasLoreignore(repoPath);
@@ -617,13 +628,12 @@ const scanningRepos = new Set();
  * refetch; deduped per repo so overlapping requests do not start redundant
  * scans.
  * @param {string} repoPath repository path
- * @param {Record<string, unknown>} globalArgs SDK global args (repositoryPath)
  * @param {string} key the cache key the fast result was stored under
  */
-function startBackgroundScan(repoPath, globalArgs, key) {
+function startBackgroundScan(repoPath, key) {
   if (scanningRepos.has(repoPath)) return;
   scanningRepos.add(repoPath);
-  fetchStatus(repoPath, globalArgs, true)
+  fetchStatus(repoPath, true)
     .then((data) => {
       cache.put(key, data);
       broadcastRefresh(repoPath, "scan");
@@ -721,7 +731,7 @@ const server = createServer(async (req, res) => {
       const key = cache.repoKey(repoPath || "", `history:${length}`);
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
       const revisions = await cache.cached(key, cache.TTL.repo, async () => {
-        const events = await collect("revisionHistory", globalArgs, { length });
+        const events = await collect("revisionHistory", readArgs(repoPath), { length });
         return xform.history(events);
       });
       return sendJson(res, 200, { revisions });
@@ -730,11 +740,11 @@ const server = createServer(async (req, res) => {
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
       const key = cache.repoKey(repoPath, "status");
       const out = await cache.cached(key, cache.TTL.repo, async () => {
-        const data = await fetchStatus(repoPath, globalArgs, false);
+        const data = await fetchStatus(repoPath, false);
         data.scanning = true;
         return data;
       });
-      if (out.scanning) startBackgroundScan(repoPath, globalArgs, key);
+      if (out.scanning) startBackgroundScan(repoPath, key);
       return sendJson(res, 200, out);
     }
     if (p === "/api/branches" && req.method === "GET") {
@@ -742,7 +752,7 @@ const server = createServer(async (req, res) => {
       const archived = q.get("archived") === "true";
       const key = cache.repoKey(repoPath, `branches:${archived ? "all" : "active"}`);
       const branches = await cache.cached(key, cache.TTL.repo, async () => {
-        const events = await collect("branchList", globalArgs, { archived });
+        const events = await collect("branchList", readArgs(repoPath), { archived });
         return xform.branches(events);
       });
       return sendJson(res, 200, { branches });
@@ -754,13 +764,13 @@ const server = createServer(async (req, res) => {
       const archived = q.get("archived") === "true";
       const key = cache.repoKey(repoPath, `graph:${length}:${archived ? "all" : "active"}`);
       const graph = await cache.cached(key, cache.TTL.repo, async () => {
-        const branchEvents = await collect("branchList", globalArgs, { archived });
+        const branchEvents = await collect("branchList", readArgs(repoPath), { archived });
         const branches = xform.branches(branchEvents);
         const histories = {};
         // Fetch per-branch history in parallel, degrading gracefully
         await Promise.all(
           branches.map((b) =>
-            collect("revisionHistory", globalArgs, {
+            collect("revisionHistory", readArgs(repoPath), {
               branch: b.name,
               length,
               onlyBranch: true,
@@ -866,12 +876,12 @@ const server = createServer(async (req, res) => {
       const target = q.get("target");
       if (source) args.sourceRevision = source;
       if (target) args.targetRevision = target;
-      const events = await collect("fileDiff", globalArgs, args);
+      const events = await collect("fileDiff", repoPath ? readArgs(repoPath) : globalArgs, args);
       return sendJson(res, 200, { diff: xform.diff(events) });
     }
     if (p === "/api/revision" && req.method === "GET") {
       const revision = q.get("revision");
-      const events = await collect("revisionInfo", globalArgs, { revision, delta: true });
+      const events = await collect("revisionInfo", repoPath ? readArgs(repoPath) : globalArgs, { revision, delta: true });
       return sendJson(res, 200, { files: xform.revisionFiles(events) });
     }
 

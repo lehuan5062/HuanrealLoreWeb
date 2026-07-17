@@ -831,7 +831,12 @@ const server = createServer(async (req, res) => {
       const archived = q.get("archived") === "true";
       const key = cache.repoKey(repoPath, `branches:${archived ? "all" : "active"}`);
       const branches = await cache.cached(key, cache.TTL.repo, async () => {
-        const events = await collect("branchList", readArgs(repoPath), { archived });
+        // Online: branchList only enumerates remote branches (the entries the UI
+        // needs to tell "on server" from "local only") when not offline — see
+        // list_output's `if local { return }` before list_remote_output. Forcing
+        // offline here would report every branch as local-only. Degrades on its
+        // own when the server is unreachable (remote entries just omitted).
+        const events = await collect("branchList", { repositoryPath: repoPath }, { archived });
         return xform.branches(events);
       });
       return sendJson(res, 200, { branches });
@@ -843,7 +848,10 @@ const server = createServer(async (req, res) => {
       const archived = q.get("archived") === "true";
       const key = cache.repoKey(repoPath, `graph:${length}:${archived ? "all" : "active"}`);
       const graph = await cache.cached(key, cache.TTL.repo, async () => {
-        const branchEvents = await collect("branchList", readArgs(repoPath), { archived });
+        // Online branchList so remote branches are enumerated for the local-only /
+        // remote-only badges (see /api/branches above). Per-branch history below
+        // stays offline — the graph lanes are built from local revisions.
+        const branchEvents = await collect("branchList", { repositoryPath: repoPath }, { archived });
         const branches = xform.branches(branchEvents);
         const histories = {};
         // Fetch per-branch history in parallel, degrading gracefully

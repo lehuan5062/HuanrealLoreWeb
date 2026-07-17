@@ -301,8 +301,9 @@ async function loadStatus(pathEnc) {
     // Render merge UI if in merge
     renderMergeUI(data);
 
-    const staged = data.files.filter((f) => f.flagStaged);
-    const unstaged = data.files.filter((f) => !f.flagStaged);
+    const byPath = (a, b) => a.path.localeCompare(b.path, undefined, { sensitivity: "base" });
+    const staged = data.files.filter((f) => f.flagStaged).sort(byPath);
+    const unstaged = data.files.filter((f) => !f.flagStaged).sort(byPath);
     renderFiles($("#staged-files"), staged, "unstage");
     renderFiles($("#unstaged-files"), unstaged, "stage");
     $("#commit-btn").disabled = staged.length === 0;

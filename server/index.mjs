@@ -708,6 +708,42 @@ async function resetFiles(rp, paths) {
 }
 
 /**
+ * Run a content-reading verb (fileDiff, revisionInfo) on the fast local-only path
+ * (offline), and if the needed content isn't in the local store
+ * (ADDRESS_NOT_FOUND), retry once with remote resolution enabled so the SDK
+ * fetches the missing blob on demand. This keeps the common case fast (the 407a090
+ * no-stall behavior) while still rendering diffs/revision files in a partially-
+ * synced repo. Read-only: unlike the revert path it never mutates the working
+ * tree, so it drops `offline` rather than running revisionSync.
+ * @param {string} verb such as "fileDiff"
+ * @param {string|null} repoPath the repo, or null for a repo-less read
+ * @param {Record<string, unknown>} args verb-specific arguments
+ * @returns {Promise<import("./sdk.mjs").LoreEvt[]>}
+ */
+async function collectRead(verb, repoPath, args) {
+  if (!repoPath) return collect(verb, {}, args);
+  try {
+    return await collect(verb, readArgs(repoPath), args);
+  } catch (err) {
+    if (!isAddressNotFound(err)) throw err;
+    // Content missing from the local store: retry with remote-first resolution
+    // (drop `offline`) so the SDK fetches it. Only paid on a genuine cache miss.
+    log.debug("read verb missing content offline; retrying online", { verb, repo: repoPath });
+    try {
+      return await collect(verb, { repositoryPath: repoPath }, args);
+    } catch (retryErr) {
+      if (!isAddressNotFound(retryErr)) throw retryErr;
+      const actionable = new LoreVerbError(
+        "Content isn't available locally yet — sync this repo to view this diff.",
+        { verb, status: retryErr.status, code: retryErr.code },
+      );
+      actionable.httpStatus = 409;
+      throw actionable;
+    }
+  }
+}
+
+/**
  * Run a streaming verb and pipe its events to the client as newline-delimited
  * JSON (one normalized event per line). Used for long operations (sync, push,
  * clone) so the browser can render live progress. Ends with the DONE marker.
@@ -736,7 +772,6 @@ const server = createServer(async (req, res) => {
     const p = url.pathname;
     const q = url.searchParams;
     const repoPath = q.get("path");
-    const globalArgs = repoPath ? { repositoryPath: repoPath } : {};
 
     if (p === "/events" && req.method === "GET") return addClient(res);
 
@@ -920,12 +955,12 @@ const server = createServer(async (req, res) => {
       const target = q.get("target");
       if (source) args.sourceRevision = source;
       if (target) args.targetRevision = target;
-      const events = await collect("fileDiff", repoPath ? readArgs(repoPath) : globalArgs, args);
+      const events = await collectRead("fileDiff", repoPath, args);
       return sendJson(res, 200, { diff: xform.diff(events) });
     }
     if (p === "/api/revision" && req.method === "GET") {
       const revision = q.get("revision");
-      const events = await collect("revisionInfo", repoPath ? readArgs(repoPath) : globalArgs, { revision, delta: true });
+      const events = await collectRead("revisionInfo", repoPath, { revision, delta: true });
       return sendJson(res, 200, { files: xform.revisionFiles(events) });
     }
 

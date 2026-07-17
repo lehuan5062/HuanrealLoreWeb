@@ -11,7 +11,8 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
 import { log } from "./log.mjs";
-import { collect, stream, configureSdk, shutdownSdk } from "./sdk.mjs";
+import { collect, stream, configureSdk, shutdownSdk, LoreVerbError } from "./sdk.mjs";
+import { LoreErrorCode } from "@lore-vcs/sdk/types/enums";
 import * as store from "./store.mjs";
 import * as xform from "./transforms.mjs";
 import { addClient, broadcastRefresh } from "./events.mjs";
@@ -663,6 +664,49 @@ function absFiles(repoPath, files) {
   return files.map((f) => (repoPath ? join(repoPath, f) : f));
 }
 
+/** True for a LoreVerbError raised because a content blob isn't in the local store. */
+function isAddressNotFound(err) {
+  return err instanceof LoreVerbError && err.code === LoreErrorCode.ADDRESS_NOT_FOUND;
+}
+
+/**
+ * Revert files to their committed base (fileReset). Reverting a *modified* tracked
+ * file realizes its base content back into the working tree, which needs that
+ * content in the local store; a lazily/partially-synced repo may not have it yet,
+ * so the first attempt fails with ADDRESS_NOT_FOUND. When that happens, pull the
+ * missing committed content from the remote (revisionSync, without discarding the
+ * working tree) and retry once. If content is still unreachable, raise an
+ * actionable error instead of leaking the raw content address.
+ * @param {string} rp repository path
+ * @param {string[]|undefined} paths absolute file paths, or undefined for whole-tree
+ */
+async function resetFiles(rp, paths) {
+  // purge is required to discard newly added (untracked) files/folders — without
+  // it, fileReset only reverts already-tracked modified content and silently
+  // leaves added entries dirty.
+  const args = { paths, purge: true };
+  try {
+    await collect("fileReset", { repositoryPath: rp }, args);
+  } catch (err) {
+    if (!isAddressNotFound(err)) throw err;
+    log.debug("fileReset missing base content; syncing then retrying", { repo: rp });
+    // reset:false materializes missing committed content without resetting the
+    // working tree over the user's other changes.
+    await collect("revisionSync", { repositoryPath: rp }, { reset: false });
+    try {
+      await collect("fileReset", { repositoryPath: rp }, args);
+    } catch (retryErr) {
+      if (!isAddressNotFound(retryErr)) throw retryErr;
+      const actionable = new LoreVerbError(
+        "File content isn't available locally yet — sync this repo, then retry the revert.",
+        { verb: "fileReset", status: retryErr.status, code: retryErr.code },
+      );
+      actionable.httpStatus = 409;
+      throw actionable;
+    }
+  }
+}
+
 /**
  * Run a streaming verb and pipe its events to the client as newline-delimited
  * JSON (one normalized event per line). Used for long operations (sync, push,
@@ -901,10 +945,7 @@ const server = createServer(async (req, res) => {
     }
     if (p === "/api/reset" && req.method === "POST") {
       const { path: rp, files } = await readBody(req);
-      // purge is required to discard newly added (untracked) files/folders — without
-      // it, fileReset only reverts already-tracked modified content and silently
-      // leaves added entries dirty.
-      await collect("fileReset", { repositoryPath: rp }, { paths: absFiles(rp, files), purge: true });
+      await resetFiles(rp, absFiles(rp, files));
       notifyChanged(rp, "reset");
       return sendJson(res, 200, { ok: true });
     }

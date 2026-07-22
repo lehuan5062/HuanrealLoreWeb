@@ -124,6 +124,9 @@ function notifyChanged(repoPath, reason) {
   } else {
     cache.invalidateRepo(repoPath);
   }
+  // The online branch enumeration lives outside cache.mjs (see onlineBranches),
+  // so it needs its own invalidation on a mutation that could change branches.
+  clearOnlineBranches(repoPath);
   broadcastRefresh(repoPath, reason);
 }
 
@@ -645,6 +648,103 @@ function startBackgroundScan(repoPath, key) {
     .finally(() => scanningRepos.delete(repoPath));
 }
 
+// ---- Branch enumeration --------------------------------------------------
+// The render path (status/history/branch graph, refetched after every sync,
+// switch, poll, focus, and file-watch) must never block on the remote. branchList
+// run online connects to the Lore server, and a slow or unreachable server there
+// makes the whole refresh hang for VERB_TIMEOUT_MS or fail with a "Not found" /
+// timeout that surfaces as a toast even though the sync itself succeeded. So the
+// render path uses an OFFLINE branchList (local branches only, instant), and the
+// remote enumeration — needed only for the "local only" / "remote only" cleanup
+// badges — is refreshed in the background and merged in when it arrives.
+
+/** Offline (local-only) branch list. No remote connect — safe on the render path. */
+async function fetchBranchesOffline(repoPath, archived) {
+  const events = await collect("branchList", { repositoryPath: repoPath, offline: true }, { archived });
+  return xform.branches(events);
+}
+
+/**
+ * Online branch list. Enumerates remote entries too (a pushed branch appears as
+ * both a LOCAL and a REMOTE entry), which is what lets the UI tell local-only from
+ * remote-only. It connects to the remote, so it can stall or fail — only ever
+ * called from the background refresh below, never on the render path.
+ */
+async function fetchBranchesOnline(repoPath, archived) {
+  const events = await collect("branchList", { repositoryPath: repoPath }, { archived });
+  return xform.branches(events);
+}
+
+/**
+ * Last successful online branch enumeration, keyed by repo+archived. Held here
+ * rather than in the shared cache (cache.mjs) on purpose: that cache's
+ * stale-while-revalidate would re-run the *offline* fetcher on the render path
+ * and clobber this remote-aware value, making the badges flicker every softMs.
+ * @type {Map<string, { branches: object[], fetchedAt: number }>}
+ */
+const onlineBranches = new Map();
+const onlineBranchInflight = new Set();
+const ONLINE_BRANCH_TTL_MS = Number(process.env.LORE_WEB_ONLINE_BRANCH_TTL_MS ?? 60_000);
+
+function onlineBranchesKey(repoPath, archived) {
+  return `${toUnixPath(repoPath)} branches-online:${archived ? "all" : "active"}`;
+}
+
+/** Drop cached online enumerations for a repo (or all) after a mutation, so the
+ *  next refresh re-reads the remote instead of serving a pre-change branch set. */
+function clearOnlineBranches(repoPath) {
+  if (!repoPath || repoPath === "*") return onlineBranches.clear();
+  const prefix = `${toUnixPath(repoPath)} `;
+  for (const key of onlineBranches.keys()) {
+    if (key.startsWith(prefix)) onlineBranches.delete(key);
+  }
+}
+
+/**
+ * Refresh the cached online branch enumeration in the background: deduped so only
+ * one runs per key at a time, and rate-limited by ONLINE_BRANCH_TTL_MS so a
+ * failing remote is retried at most once per interval instead of on every refetch.
+ * Broadcasts a refresh only when the enumeration actually changed, so clients pick
+ * up accurate badges without periodic churn. A slow/unreachable remote fails
+ * quietly here — it never reaches the render path.
+ */
+function refreshOnlineBranches(repoPath, archived) {
+  const key = onlineBranchesKey(repoPath, archived);
+  if (onlineBranchInflight.has(key)) return;
+  const entry = onlineBranches.get(key);
+  if (entry && Date.now() - entry.fetchedAt < ONLINE_BRANCH_TTL_MS) return;
+  onlineBranchInflight.add(key);
+  fetchBranchesOnline(repoPath, archived)
+    .then((branches) => {
+      const prev = onlineBranches.get(key);
+      onlineBranches.set(key, { branches, fetchedAt: Date.now() });
+      if (!prev || JSON.stringify(prev.branches) !== JSON.stringify(branches)) {
+        broadcastRefresh(repoPath, "branches-enriched");
+      }
+    })
+    .catch((err) => {
+      log.debug("online branch enrichment failed", { key, message: err instanceof Error ? err.message : String(err) });
+    })
+    .finally(() => onlineBranchInflight.delete(key));
+}
+
+/**
+ * Branch list for the render path: the last-known online enumeration when we have
+ * one (remoteKnown: true, so the UI shows accurate badges), otherwise the fast
+ * offline list (remoteKnown: false, so the UI suppresses badges rather than
+ * flashing a wrong "local only" on every branch). Always kicks a background
+ * online refresh so the enumeration converges; never blocks on the remote.
+ * @returns {Promise<{ branches: object[], remoteKnown: boolean }>}
+ */
+async function resolveBranches(repoPath, archived) {
+  refreshOnlineBranches(repoPath, archived);
+  const online = onlineBranches.get(onlineBranchesKey(repoPath, archived));
+  if (online) return { branches: online.branches, remoteKnown: true };
+  const key = cache.repoKey(repoPath, `branches:${archived ? "all" : "active"}`);
+  const branches = await cache.cached(key, cache.TTL.repo, () => fetchBranchesOffline(repoPath, archived));
+  return { branches, remoteKnown: false };
+}
+
 /**
  * DELETE /api/repos — stop tracking a repo. Always succeeds, even if the folder
  * is gone (issue #4: the desktop refused to remove a repo with a missing folder).
@@ -829,32 +929,27 @@ const server = createServer(async (req, res) => {
     if (p === "/api/branches" && req.method === "GET") {
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
       const archived = q.get("archived") === "true";
-      const key = cache.repoKey(repoPath, `branches:${archived ? "all" : "active"}`);
-      const branches = await cache.cached(key, cache.TTL.repo, async () => {
-        // Online: branchList only enumerates remote branches (the entries the UI
-        // needs to tell "on server" from "local only") when not offline — see
-        // list_output's `if local { return }` before list_remote_output. Forcing
-        // offline here would report every branch as local-only. Degrades on its
-        // own when the server is unreachable (remote entries just omitted).
-        const events = await collect("branchList", { repositoryPath: repoPath }, { archived });
-        return xform.branches(events);
-      });
-      return sendJson(res, 200, { branches });
+      // Offline on the render path; remote enumeration is merged in once the
+      // background refresh lands (see resolveBranches). remoteKnown tells the UI
+      // whether the local-only / remote-only badges are trustworthy yet.
+      const { branches, remoteKnown } = await resolveBranches(repoPath, archived);
+      return sendJson(res, 200, { branches, remoteKnown });
     }
 
     if (p === "/api/graph" && req.method === "GET") {
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
       const length = Number(q.get("length") ?? 100);
       const archived = q.get("archived") === "true";
-      const key = cache.repoKey(repoPath, `graph:${length}:${archived ? "all" : "active"}`);
-      const graph = await cache.cached(key, cache.TTL.repo, async () => {
-        // Online branchList so remote branches are enumerated for the local-only /
-        // remote-only badges (see /api/branches above). Per-branch history below
-        // stays offline — the graph lanes are built from local revisions.
-        const branchEvents = await collect("branchList", { repositoryPath: repoPath }, { archived });
-        const branches = xform.branches(branchEvents);
-        const histories = {};
-        // Fetch per-branch history in parallel, degrading gracefully
+      const { branches, remoteKnown } = await resolveBranches(repoPath, archived);
+      // Per-branch history is built from local revisions (offline) and cached
+      // under a key that includes the branch set, so an enrichment that adds or
+      // changes branches naturally rebuilds instead of serving a stale graph.
+      const sig = branches.map((b) => `${b.id}:${b.latest}`).join(",");
+      const key = cache.repoKey(repoPath, `graph:${length}:${archived ? "all" : "active"}:${sig}`);
+      const histories = await cache.cached(key, cache.TTL.repo, async () => {
+        const out = {};
+        // Fetch per-branch history in parallel, degrading gracefully — a
+        // remote-only branch with no local revisions just gets an empty lane.
         await Promise.all(
           branches.map((b) =>
             collect("revisionHistory", readArgs(repoPath), {
@@ -863,17 +958,17 @@ const server = createServer(async (req, res) => {
               onlyBranch: true,
             })
               .then((events) => {
-                histories[b.id] = xform.graphHistory(events);
+                out[b.id] = xform.graphHistory(events);
               })
               .catch((err) => {
                 log.debug("graph history fetch failed", { branch: b.name, message: err instanceof Error ? err.message : String(err) });
-                histories[b.id] = [];
+                out[b.id] = [];
               })
           )
         );
-        return { branches, histories };
+        return out;
       });
-      return sendJson(res, 200, graph);
+      return sendJson(res, 200, { branches, histories, remoteKnown });
     }
     // Branch mutations: quick ops that return immediately
     if (p === "/api/branch/create" && req.method === "POST") {

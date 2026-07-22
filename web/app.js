@@ -818,11 +818,17 @@ async function loadBranches(pathEnc) {
     // only in the local cache was either never pushed or archived on the server
     // by a collaborator (archives delete server-side but never prune other
     // clients' local caches) — surfaced as a badge so it can be tidied.
+    // remoteKnown is false while the server is still serving the fast offline
+    // branch list (remote enumeration pending in the background); the list is
+    // local-only then, so suppress both badges rather than flash a wrong "local
+    // only" on every branch. The background enrichment pushes an SSE refresh when
+    // the remote data lands, and this recomputes with accurate badges.
+    const remoteKnown = graphData.remoteKnown !== false;
     const localIds = new Set(graphData.branches.filter((b) => b.location === 0).map((b) => b.id));
     const remoteIds = new Set(graphData.branches.filter((b) => b.location === 1).map((b) => b.id));
     for (const b of deduped) {
-      b.localOnly = localIds.has(b.id) && !remoteIds.has(b.id);
-      b.remoteOnly = remoteIds.has(b.id) && !localIds.has(b.id);
+      b.localOnly = remoteKnown && localIds.has(b.id) && !remoteIds.has(b.id);
+      b.remoteOnly = remoteKnown && remoteIds.has(b.id) && !localIds.has(b.id);
     }
     state.branches = deduped;
 
